@@ -6,7 +6,7 @@ import { accessSync, appendFileSync, constants, existsSync, mkdirSync, readFileS
 import { basename, dirname, join } from "node:path";
 import { escape } from "es-toolkit";
 import { z } from "zod";
-import { codexPaths, HOME, paths } from "./paths.ts";
+import { codexPaths, grokPaths, HOME, paths } from "./paths.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { installedBin, installSettings, isOurHookCommand, uninstallSettings } from "./settings.ts";
 import { resolveRealClaude } from "./claudebin.ts";
@@ -223,6 +223,52 @@ export function installCodexSupervisor(): void {
 export function uninstallCodexSupervisor(): void {
   uninstallCodexStopHook();
   if (existsSync(codexSupervisorLink())) rmSync(codexSupervisorLink(), { force: true });
+}
+
+// ---- grok supervisor + hook sibling file ------------------------------------
+
+const GROK_STOP_HOOK_SUBCOMMAND = "__grok-stop-hook";
+
+/** The one hook file tokenmaxxing owns: a SIBLING under ~/.grok/hooks/, which
+ *  grok always trusts (global hooks need no /hooks step - verified against the
+ *  1.0.8 docs). Owning the whole file means install/uninstall never merge into
+ *  another tool's declarations (e.g. cmux-session.json, which must never be
+ *  touched). Stop gates the turn boundary (reason-filtered in the handler,
+ *  timeout well under grok's 600s default so a wedged decision cannot hold the
+ *  turn); StopFailure matches rate_limit only (503/529 classify there) for the
+ *  reactive swap. */
+export function grokHookFileContent(): string {
+  const command = `${JSON.stringify(installedBin())} ${GROK_STOP_HOOK_SUBCOMMAND}`;
+  return (
+    JSON.stringify(
+      {
+        description: "tokenmaxxing grok pool: swap accounts near the weekly limit",
+        hooks: {
+          Stop: [{ hooks: [{ type: "command", command, timeout: 15 }] }],
+          StopFailure: [{ matcher: "rate_limit", hooks: [{ type: "command", command, timeout: 15 }] }],
+        },
+      },
+      null,
+      2,
+    ) + "\n"
+  );
+}
+
+export function grokSupervisorLink(): string {
+  return join(paths.binDir, "grok");
+}
+
+/** The on-PATH `grok` wrapper + the hook sibling file. */
+export function installGrokSupervisor(): void {
+  mkdirSync(paths.binDir, { recursive: true });
+  writeFileAtomic(grokSupervisorLink(), `#!/bin/sh\nexec ${JSON.stringify(installedBin())} __supervise-grok "$@"\n`, 0o755);
+  mkdirSync(dirname(grokPaths.hooksJson), { recursive: true });
+  writeFileAtomic(grokPaths.hooksJson, grokHookFileContent(), 0o644);
+}
+
+export function uninstallGrokSupervisor(): void {
+  rmSync(grokPaths.hooksJson, { force: true });
+  if (existsSync(grokSupervisorLink())) rmSync(grokSupervisorLink(), { force: true });
 }
 
 // ---- periodic `check` timer ------------------------------------------------
@@ -542,6 +588,7 @@ export function uninstallSupervisor(): UninstallOutcome {
   uninstallSettings();
   const timerDeactivated = uninstallCheckTimer();
   uninstallCodexSupervisor();
+  uninstallGrokSupervisor();
   for (const f of [paths.supervisorLink, join(paths.binDir, "xx"), installedBin()]) {
     if (existsSync(f)) rmSync(f, { force: true });
   }

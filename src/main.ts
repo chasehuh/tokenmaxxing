@@ -15,8 +15,14 @@ import { cmdAuth } from "./cli/auth.ts";
 import { cmdCodexAdd } from "./cli/codexadd.ts";
 import { cmdCodexInit } from "./cli/codexinit.ts";
 import { cmdCodexSwitch } from "./cli/codexswitch.ts";
+import { cmdGrokAdd } from "./cli/grokadd.ts";
+import { cmdGrokInit } from "./cli/grokinit.ts";
+import { cmdGrokSwitch } from "./cli/grokswitch.ts";
+import { cmdGrokRm } from "./cli/grokrm.ts";
 import { runCodexSupervisor } from "./entries/codexsupervisor.ts";
 import { runCodexStopHook } from "./entries/codexstophook.ts";
+import { runGrokSupervisor } from "./entries/groksupervisor.ts";
+import { runGrokStopHook } from "./entries/grokstophook.ts";
 import { cmdLs } from "./cli/ls.ts";
 import { cmdStatus } from "./cli/status.ts";
 import { cmdWatch } from "./cli/watch.ts";
@@ -38,21 +44,34 @@ function printHelp(): void {
   ${c.cyan("tokenmaxxing check")}      evaluate once, switch if over threshold (run by the periodic timer)
   ${c.cyan("tokenmaxxing init")}       import the current account + install supervisor & hooks
   ${c.cyan("tokenmaxxing init --codex")}  same for codex: import login, install codex supervisor + Stop hook (trust it via /hooks)
+  ${c.cyan("tokenmaxxing init --grok")}   same for grok: import the SuperGrok login, install grok supervisor + hooks (auto-trusted)
   ${c.cyan("tokenmaxxing add")}        register an additional account (isolated login)
   ${c.cyan("tokenmaxxing add --codex")}   register an additional codex account (isolated login)
+  ${c.cyan("tokenmaxxing add --grok")}    register an additional grok account (isolated login)
   ${c.cyan("tokenmaxxing auth")} [sel | --all]  reauthenticate a pooled account in place (bare = pick from a list; --all = every needs-reauth account, one by one)
   ${c.cyan("tokenmaxxing switch --codex")} [sel]  switch the codex pool (takes effect on next codex start)
+  ${c.cyan("tokenmaxxing switch --grok")} [sel]   switch the grok pool (running sessions hot-reload on their next API call)
   ${c.cyan("tokenmaxxing ls")}         list pooled accounts
-  ${c.cyan("tokenmaxxing status")}     accounts with 5h / weekly / per-model usage bars
+  ${c.cyan("tokenmaxxing status")}     accounts with 5h / weekly / per-model usage bars (grok: weekly only; never pinged by --force)
   ${c.cyan("tokenmaxxing status --force")}  ping every account (one tiny haiku request each) so all 5h session timers start now, then sample fresh; ${c.cyan("xx --force")} works too
   ${c.cyan("tokenmaxxing watch")} [seconds]  live status: re-render every N seconds (default 120, never pings)
   ${c.cyan("tokenmaxxing config")} [get|set|unset|tidy]  inspect and edit config.json (bare = effective config with sources)
   ${c.cyan("tokenmaxxing doctor")}     verify the install is intact
-  ${c.cyan("tokenmaxxing rename")} [--codex] <sel> <label>
-  ${c.cyan("tokenmaxxing rm")} [--codex] <sel>
+  ${c.cyan("tokenmaxxing rename")} [--codex|--grok] <sel> <label>
+  ${c.cyan("tokenmaxxing rm")} [--codex|--grok] <sel>
   ${c.cyan("tokenmaxxing uninstall")}  remove supervisor + settings entries
 
   ${c.dim("(aliased as")} ${c.cyan("xx")}${c.dim(")")} - then just run ${c.bold("claude")} as always; it switches accounts near quota automatically.`);
+}
+
+/** `--codex` and `--grok` name different pools; a command carrying both has
+ *  no defensible winner, so it refuses instead of silently picking one. */
+function poolFlagConflict(args: string[]): boolean {
+  if (args.includes("--codex") && args.includes("--grok")) {
+    console.error(c.red("--codex and --grok are mutually exclusive"));
+    return true;
+  }
+  return false;
 }
 
 async function main(): Promise<number> {
@@ -70,6 +89,9 @@ async function main(): Promise<number> {
   }
   if (argv0 === "codex" || sub === "__supervise-codex") {
     return runCodexSupervisor({ argv: sub === "__supervise-codex" ? args.slice(1) : args });
+  }
+  if (argv0 === "grok" || sub === "__supervise-grok") {
+    return runGrokSupervisor({ argv: sub === "__supervise-grok" ? args.slice(1) : args });
   }
 
   // CLI commands refuse an ambient claude store override (closing-review
@@ -100,29 +122,43 @@ async function main(): Promise<number> {
     case "__stop-hook": return runStopHook();
     case "__session-start": return runSessionStart();
     case "__codex-stop-hook": return runCodexStopHook();
+    case "__grok-stop-hook": return runGrokStopHook();
     case undefined: return cmdStatus(); // bare `tokenmaxxing` / `xx` → status
     case "--force": return cmdStatus(true); // bare `xx --force` → status --force
-    // --codex accepted anywhere, like init/add/status: the old args[1]-only
-    // check made `xx switch <sel> --codex` silently run a real CLAUDE swap
-    // (one email can hold both pools' accounts - closing-review catch).
+    // --codex/--grok accepted anywhere, like init/add/status: the old
+    // args[1]-only check made `xx switch <sel> --codex` silently run a real
+    // CLAUDE swap (one email can hold every pool's accounts - closing-review
+    // catch; --grok inherits the fix from day one).
     case "switch": {
-      const rest = args.slice(1).filter((a) => a !== "--codex");
+      if (poolFlagConflict(args)) return 2;
+      const rest = args.slice(1).filter((a) => a !== "--codex" && a !== "--grok");
+      if (args.includes("--grok")) return cmdGrokSwitch(rest[0]);
       return args.includes("--codex") ? cmdCodexSwitch(rest[0]) : cmdSwitch(rest[0]);
     }
     case "check": return cmdCheck();
     case "config": return cmdConfig(args.slice(1));
-    case "init": return args.includes("--codex") ? cmdCodexInit() : cmdInit();
-    case "add": return args.includes("--codex") ? cmdCodexAdd() : cmdAdd();
+    case "init": {
+      if (poolFlagConflict(args)) return 2;
+      if (args.includes("--grok")) return cmdGrokInit();
+      return args.includes("--codex") ? cmdCodexInit() : cmdInit();
+    }
+    case "add": {
+      if (poolFlagConflict(args)) return 2;
+      if (args.includes("--grok")) return cmdGrokAdd();
+      return args.includes("--codex") ? cmdCodexAdd() : cmdAdd();
+    }
     case "auth": return cmdAuth(args.slice(1));
     case "ls": return cmdLs();
     case "status": return cmdStatus(args.includes("--force"));
     case "watch": return cmdWatch(args[1]);
     case "doctor": return cmdDoctor();
-    // --codex accepted anywhere, like switch/rename: the two pools are
+    // --codex/--grok accepted anywhere, like switch/rename: the pools are
     // separate namespaces and codex accounts were otherwise unremovable
     // (adversarial-review catch).
     case "rm": {
-      const rest = args.slice(1).filter((a) => a !== "--codex");
+      if (poolFlagConflict(args)) return 2;
+      const rest = args.slice(1).filter((a) => a !== "--codex" && a !== "--grok");
+      if (args.includes("--grok")) return cmdGrokRm(rest[0]);
       return args.includes("--codex") ? cmdCodexRm(rest[0]) : cmdRm(rest[0]);
     }
     case "rename": return cmdRename(args.slice(1));
@@ -140,7 +176,7 @@ async function main(): Promise<number> {
       console.log(`removed ${removed.join(", ")}`);
       if (!out.timerDeactivated) console.log(c.yellow(`⚠ the check job may still be loaded - run: ${timerDeactivationHint()}`));
       if (!out.pathLineRemoved) console.log(c.dim("(no tokenmaxxing PATH line found in the shell rc)"));
-      console.log(`kept: accounts.json, config.json, and every parked credential (claude - macOS: keychain items, Linux: creds/; codex: codex-creds/) - remove accounts with \`xx rm\` to delete their credentials`);
+      console.log(`kept: accounts.json, config.json, and every parked credential (claude - macOS: keychain items, Linux: creds/; codex: codex-creds/; grok: grok-creds/) - remove accounts with \`xx rm\` to delete their credentials`);
       return 0;
     }
     case "help":

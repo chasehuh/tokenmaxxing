@@ -17,11 +17,14 @@ import { loadAccounts, loadConfig, loadUsage, loadModelUsage, saveAccounts } fro
 import { readOAuthAccount } from "../lib/claudejson.ts";
 import { ensureLiveTokenFresh, probeActiveUsage, probeParkedUsage, type SampleOutcome } from "../lib/sample.ts";
 import { withLock } from "../lib/lock.ts";
-import { codexPaths, paths } from "../lib/paths.ts";
+import { codexPaths, grokPaths, paths } from "../lib/paths.ts";
 import { earliestReset, effectiveBars, isExhausted, nextWeeklyReset } from "../lib/picker.ts";
 import { loadCodexAccounts, saveCodexAccounts } from "../lib/codexstate.ts";
 import { liveCodexAccountId, sampleCodexAccount, type CodexSampleOutcome } from "../lib/codexsample.ts";
 import { isCodexExhausted } from "../lib/codexpick.ts";
+import { loadGrokAccounts, saveGrokAccounts } from "../lib/grokstate.ts";
+import { liveGrokAccountId, sampleGrokAccount, type GrokSampleOutcome } from "../lib/groksample.ts";
+import { isGrokExhausted } from "../lib/grokpick.ts";
 import { codexLimitLabel, isSessionWindow } from "../lib/codexusage.ts";
 import { bar, c, claudeTierLabel, count, fmtAgo, fmtReset } from "./render.ts";
 import type { FullUsage } from "../lib/usage.ts";
@@ -46,17 +49,19 @@ export async function cmdStatus(force = false, preRender?: () => void): Promise<
   };
 
   if (idx.accounts.length === 0) {
-    // A codex-only pool is a documented standalone flow: the empty-claude
-    // early return must still render it, and only a fully empty install gets
-    // the init hint (closing-review catch: bare `xx` claimed "no accounts"
-    // over a populated codex pool and pointed at the wrong init).
-    if (loadCodexAccounts().accounts.length > 0) {
+    // A codex- or grok-only pool is a documented standalone flow: the
+    // empty-claude early return must still render them, and only a fully
+    // empty install gets the init hint (closing-review catch: bare `xx`
+    // claimed "no accounts" over a populated codex pool and pointed at the
+    // wrong init).
+    if (loadCodexAccounts().accounts.length > 0 || loadGrokAccounts().accounts.length > 0) {
       console.log(c.dim("no claude accounts (run `tokenmaxxing init` to pool claude too)"));
       console.log();
       await renderCodexSection({ cfg, now, row });
+      await renderGrokSection({ cfg, now, row });
       return 0;
     }
-    console.log(c.dim("no accounts yet, run `tokenmaxxing init` (or `tokenmaxxing init --codex`)"));
+    console.log(c.dim("no accounts yet, run `tokenmaxxing init` (or `tokenmaxxing init --codex` / `--grok`)"));
     return 0;
   }
 
@@ -209,6 +214,7 @@ export async function cmdStatus(force = false, preRender?: () => void): Promise<
   }
 
   await renderCodexSection({ cfg, now, row });
+  await renderGrokSection({ cfg, now, row });
   return 0;
 }
 
@@ -280,6 +286,69 @@ async function renderCodexSection(input: {
     const outcome = outcomes.get(account.accountId);
     if (outcome && !outcome.ok) {
       const cached = usage ? `cached${account.lastUsageAt != null ? ` ${fmtAgo(account.lastUsageAt, now)}` : ""}, ` : "";
+      console.log(`    ${c.yellow(`${cached}live sample failed`)}: ${c.dim(outcome.reason)}`);
+    }
+    console.log();
+  }
+}
+
+/** The grok pool, appended when it is non-empty. One weekly bar per account
+ *  from the free credits GET; `--force` never pings grok (there is no session
+ *  window to start and nothing metered to spend, issue #1), so this section
+ *  renders identically with and without it. */
+async function renderGrokSection(input: {
+  cfg: Config;
+  now: number;
+  row: (name: string, w: UsageWindow, weekly: boolean) => void;
+}): Promise<void> {
+  const { cfg, now, row } = input;
+  let index = loadGrokAccounts();
+  if (index.accounts.length === 0) return;
+
+  console.error(c.dim("sampling grok usage..."));
+  const outcomes = new Map<string, GrokSampleOutcome>();
+  let liveId: string | null = null;
+  await withLock(grokPaths.lockFile, async () => {
+    index = loadGrokAccounts();
+    liveId = liveGrokAccountId();
+    await Promise.all(
+      index.accounts.map(async (account) => {
+        const outcome = await sampleGrokAccount({ account, liveAccountId: liveId, now });
+        outcomes.set(account.accountId, outcome);
+        if (outcome.ok) {
+          account.lastUsage = { weekly: outcome.usage.weekly };
+          account.lastUsageAt = Date.now();
+        } else if (outcome.deadGrant) {
+          account.needsReauth = true;
+        }
+      }),
+    );
+    saveGrokAccounts({ index });
+  });
+
+  console.log(c.dim(`grok  (${count({ n: index.accounts.length, noun: "account" })})`));
+  console.log();
+  // Same display order as the other pools: earliest upcoming reset first,
+  // needs-reauth last.
+  const displayAccounts = sortBy(index.accounts, [
+    (a) => (a.needsReauth ? 1 : 0),
+    (a) => {
+      const reset = a.lastUsage?.weekly.resetsAt;
+      return reset != null && reset > now ? reset : Number.POSITIVE_INFINITY;
+    },
+  ]);
+  for (const account of displayAccounts) {
+    const active = account.accountId === liveId;
+    const marker = active ? c.green("●") : c.dim("○");
+    const badges: string[] = [];
+    if (active) badges.push(c.green("active"));
+    if (account.needsReauth) badges.push(c.red("needs-reauth"));
+    if (isGrokExhausted({ account, thresholds: effectiveBars(cfg), now })) badges.push(c.yellow("exhausted"));
+    console.log(`${marker} ${c.bold(account.label)}${account.planType ? ` ${c.dim(account.planType)}` : ""}${badges.length ? ` ${badges.join(" ")}` : ""}`);
+    if (account.lastUsage) row("week", account.lastUsage.weekly, true);
+    const outcome = outcomes.get(account.accountId);
+    if (outcome && !outcome.ok) {
+      const cached = account.lastUsage ? `cached${account.lastUsageAt != null ? ` ${fmtAgo(account.lastUsageAt, now)}` : ""}, ` : "";
       console.log(`    ${c.yellow(`${cached}live sample failed`)}: ${c.dim(outcome.reason)}`);
     }
     console.log();

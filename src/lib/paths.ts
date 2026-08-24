@@ -90,6 +90,47 @@ export function codexCredItemFor(accountId: string): string {
   return `tokenmaxxing-codex-${accountId.slice(0, 8)}`;
 }
 
+/** Grok home: where the live auth.json lives. Test override first, then
+ *  grok's own GROK_HOME env, then its default ~/.grok. */
+const GROK_HOME = env("TOKENMAXXING_GROK_HOME", env("GROK_HOME", join(HOME, ".grok")));
+
+export const grokPaths = {
+  home: GROK_HOME,
+  /** the live credential file: a map of issuer → OIDC session (0600). */
+  authJson: join(GROK_HOME, "auth.json"),
+  /** grok's OWN flock on auth.json mutations ("could not open or lock
+   *  auth.json.lock", binary-verified 1.0.8). Every tokenmaxxing read/write of
+   *  the live file holds this IN ADDITION to grok-lock: unlike codex, the
+   *  running grok serializes here too, so waiting on it closes the
+   *  rotate-under-us window codex has to live with. */
+  authJsonLock: join(GROK_HOME, "auth.json.lock"),
+  /** global hooks dir: every *.json here is ALWAYS trusted (grok 1.0.8 docs) -
+   *  no /hooks trust step. tokenmaxxing owns exactly one sibling file and
+   *  never touches the others (e.g. cmux-session.json). */
+  hooksJson: join(GROK_HOME, "hooks", "tokenmaxxing-grok.json"),
+  /** where the versioned Mach-O/ELF binaries live; `init --grok` pins the
+   *  newest one so the pin survives `grok update` clobbering ~/.grok/bin/grok. */
+  downloadsDir: join(GROK_HOME, "downloads"),
+  /** tokenmaxxing's grok pool state, parallel to the codex files in TM_HOME. */
+  accountsJson: join(TM_HOME, "grok-accounts.json"),
+  lastSwapJson: join(TM_HOME, "grok-lastswap.json"),
+  lockFile: join(TM_HOME, "grok-lock"),
+  /** parked auth.json blobs: the lossless full map, 0600 files (grok's own
+   *  store is a plaintext file; same rationale as codex-creds). */
+  credsDir: join(TM_HOME, "grok-creds"),
+  onboardDir: join(TM_HOME, "grok-onboard"),
+  respawnDir: join(TM_HOME, "grok-respawn"),
+  /** one file per RUNNING supervised grok session: {accountId, pid, ts}. A
+   *  running account's parked blob is superseded by its live rotations, so
+   *  presence benches it for samplers and the picker (codex pattern). */
+  presenceDir: join(TM_HOME, "grok-live"),
+} as const;
+
+/** Per-account parked grok credential file name: tokenmaxxing-grok-<id8>. */
+export function grokCredItemFor(accountId: string): string {
+  return `tokenmaxxing-grok-${accountId.slice(0, 8)}`;
+}
+
 /** The macOS login-keychain generic-password the live `claude` reads. */
 export const keychain = {
   service: env("TOKENMAXXING_KEYCHAIN_SERVICE", "Claude Code-credentials"),
@@ -132,6 +173,11 @@ export function realClaudeBinFromEnv(): string | undefined {
 /** Same override hook for the real codex binary (tests / relocation). */
 export function realCodexBinFromEnv(): string | undefined {
   return EnvOverrideSchema.parse(process.env.TOKENMAXXING_CODEX_BIN);
+}
+
+/** Same override hook for the real grok binary (tests / relocation). */
+export function realGrokBinFromEnv(): string | undefined {
+  return EnvOverrideSchema.parse(process.env.TOKENMAXXING_GROK_BIN);
 }
 
 export { HOME };

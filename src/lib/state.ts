@@ -3,7 +3,7 @@
 import { existsSync, readFileSync, rmSync, statSync, utimesSync } from "node:fs";
 import { isEqual } from "es-toolkit";
 import { z } from "zod";
-import { paths, realClaudeBinFromEnv, realCodexBinFromEnv } from "./paths.ts";
+import { paths, realClaudeBinFromEnv, realCodexBinFromEnv, realGrokBinFromEnv } from "./paths.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import {
   AccountsIndexSchema,
@@ -30,6 +30,7 @@ const DEFAULT_CONFIG: Config = {
   hardThresholds: { session: 100, weekly: 100 },
   claudeBin: "",
   codexBin: "",
+  grokBin: "",
   // per-model weekly caps exist only for Sonnet and Fable (no Opus-only quota,
   // per the user 2026-07-12), and only Fable's is worth switching on.
   // greedySessionFloor 50: half a session window buys the swap (user 2026-07-16).
@@ -50,6 +51,7 @@ export const ConfigFileSchema = z
     hardThresholds: z.object({ session: PercentSchema, weekly: PercentSchema }).partial(),
     claudeBin: z.string(),
     codexBin: z.string(),
+    grokBin: z.string(),
     policy: z
       .object({
         projectionMargin: PercentSchema,
@@ -87,6 +89,7 @@ export function mergeConfigFile(p: z.infer<typeof ConfigFileSchema>): MergeOutco
   cfg.hardThresholds.weekly = p.hardThresholds?.weekly ?? cfg.hardThresholds.weekly;
   cfg.claudeBin = p.claudeBin ?? cfg.claudeBin;
   cfg.codexBin = p.codexBin ?? cfg.codexBin;
+  cfg.grokBin = p.grokBin ?? cfg.grokBin;
   cfg.policy.projectionMargin = p.policy?.projectionMargin ?? cfg.policy.projectionMargin;
   cfg.policy.greedySessionFloor = p.policy?.greedySessionFloor ?? cfg.policy.greedySessionFloor;
   cfg.policy.usagePollTtlMs = p.policy?.usagePollTtlMs ?? cfg.policy.usagePollTtlMs;
@@ -99,6 +102,8 @@ export function mergeConfigFile(p: z.infer<typeof ConfigFileSchema>): MergeOutco
   if (envBin) cfg.claudeBin = envBin;
   const envCodexBin = realCodexBinFromEnv();
   if (envCodexBin) cfg.codexBin = envCodexBin;
+  const envGrokBin = realGrokBinFromEnv();
+  if (envGrokBin) cfg.grokBin = envGrokBin;
   const merged = ConfigSchema.safeParse(cfg);
   if (!merged.success) {
     // per-field values passed but the merged whole is unusable (the
@@ -140,7 +145,7 @@ export function loadConfig(): Config {
  *  default changes as stale explicit values and misreports every `xx config`
  *  source as "file" (closing-review catch; the sparse-overrides contract is
  *  config.ts's header). Throws on a corrupt file, like loadConfig. */
-export function pinBinOverride(input: { key: "claudeBin" | "codexBin"; bin: string }): void {
+export function pinBinOverride(input: { key: "claudeBin" | "codexBin" | "grokBin"; bin: string }): void {
   let raw: Record<string, unknown> = {};
   if (existsSync(paths.configJson)) {
     raw = z.record(z.string(), z.unknown()).parse(JSON.parse(readFileSync(paths.configJson, "utf8")));

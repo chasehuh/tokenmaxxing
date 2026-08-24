@@ -157,6 +157,8 @@ export const ConfigSchema = z
     claudeBin: z.string(),
     /** the real codex binary (empty = resolve from PATH); pinned by `init --codex`. */
     codexBin: z.string(),
+    /** the real grok binary (empty = resolve from PATH); pinned by `init --grok`. */
+    grokBin: z.string(),
     policy: z.object({
       /** percent margin subtracted from every bar (effectiveBars); above 100 the
        *  effective bars go negative and everything reads exhausted, so bounded. */
@@ -382,6 +384,98 @@ export const CodexRespawnMarkerSchema = z.object({
   account: z.string(),
   sessionId: z.string().nullable(),
   ts: z.number(),
+});
+
+// ---- Grok pool -------------------------------------------------------------
+
+/** One issuer entry inside $GROK_HOME/auth.json (verified against a live
+ *  grok 1.0.8 blob shape, 2026-08-25). Loose: preserve every sibling field
+ *  (create_time, first_name, profile_image_asset_id, ...) so a harvest and
+ *  reinstall round-trip is lossless. Only the fields the pool READS are
+ *  declared. `key` is the access token (the billing GET's Bearer). */
+export const GrokIssuerSchema = z.looseObject({
+  auth_mode: z.string(),
+  key: z.string(),
+  refresh_token: z.string(),
+  user_id: z.string(),
+  principal_id: z.string().optional(),
+  principal_type: z.string().optional(),
+  email: z.string().optional(),
+  expires_at: z.union([z.string(), z.number()]).optional(),
+  oidc_issuer: z.string().optional(),
+  oidc_client_id: z.string().optional(),
+});
+export type GrokIssuer = z.infer<typeof GrokIssuerSchema>;
+
+/** The whole auth.json: a top-level map of `<issuer>::<client_id>` → issuer
+ *  object. One live slot in practice (two SuperGrok users SHARE the map key),
+ *  so a swap replaces the entire map, never adds a second key. Values are
+ *  unknown at parse time: an entry that is not a poolable session login
+ *  (API-key-only, provider-command state) must not fail the whole file. */
+export const GrokAuthJsonSchema = z.record(z.string(), z.unknown());
+export type GrokAuthJson = z.infer<typeof GrokAuthJsonSchema>;
+
+/** The one weekly rate-limit window a Grok account has. The credits payload
+ *  carries NO 5h session window (verified live 2026-08-25) - do not invent
+ *  one. `usedPercentage` is USED (creditUsagePercent), never remaining. */
+const GrokWindowSchema = z.object({
+  usedPercentage: z.number(),
+  resetsAt: z.number().nullable(),
+});
+export type GrokWindow = z.infer<typeof GrokWindowSchema>;
+
+/** Everything one free billing read yields. Identity (user_id/email) comes
+ *  from the auth blob, not this JSON - the billing body carries no identity
+ *  echo, so the caller pairs it with the blob it read. */
+export const GrokUsageSchema = z.object({
+  weekly: GrokWindowSchema,
+});
+export type GrokUsage = z.infer<typeof GrokUsageSchema>;
+
+/** A pooled grok account (grok-accounts.json - NON-secret). */
+export const GrokAccountSchema = z.object({
+  /** the blob's user_id: stable identity, the token cannot lie. */
+  accountId: z.string(),
+  email: z.string().nullable(),
+  label: z.string(),
+  planType: z.string().nullable(),
+  credFile: BareFileNameSchema,
+  addedAt: z.string(),
+  needsReauth: z.boolean().optional(),
+  lastUsage: z.object({ weekly: GrokWindowSchema }).optional(),
+  lastUsageAt: z.number().optional(),
+});
+export type GrokAccount = z.infer<typeof GrokAccountSchema>;
+
+export const GrokAccountsIndexSchema = z.object({
+  version: z.literal(1),
+  activeAccountId: z.string().nullable(),
+  accounts: z.array(GrokAccountSchema).default([]),
+});
+export type GrokAccountsIndex = z.infer<typeof GrokAccountsIndexSchema>;
+
+/** Grok hook stdin (verified against the grok 1.0.8 hooks reference): the
+ *  envelope is camelCase, unlike claude/codex. `reason` distinguishes a
+ *  genuine end_turn Stop from the session-end observe fire; `error` is the
+ *  classified StopFailure type ("rate_limit", ...). */
+export const GrokStopStdinSchema = z.looseObject({
+  hookEventName: z.string().optional(),
+  sessionId: z.string().optional(),
+  reason: z.string().optional(),
+  error: z.string().optional(),
+});
+
+/** The grok supervisor's respawn marker. Unlike codex, a plain swap needs NO
+ *  respawn (grok hot-reloads auth.json on the next API call): a marker is
+ *  written only for the depleted-pool wait (`waitUntil` set - the supervisor
+ *  counts down to the reset before resuming) and for the StopFailure
+ *  rate_limit fallback (`waitUntil` null - restart now, in case the config
+ *  watcher skipped the hot-reload). */
+export const GrokRespawnMarkerSchema = z.object({
+  account: z.string(),
+  sessionId: z.string().nullable(),
+  ts: z.number(),
+  waitUntil: z.number().nullable(),
 });
 
 /** A cross-session reconcile signal (owner decisions 2026-07-20): the
