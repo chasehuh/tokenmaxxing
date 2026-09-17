@@ -8,6 +8,8 @@ Automatic Claude Code account switching. You run `claude` exactly as always; eve
 
 ---
 
+> Fork note (chasehuh/tokenmaxxing): headless launches (`codex exec`, `claude -p`, `grok -p`) are managed jobs and the grok pool is a full provider; see `docs/auto-swap-long-sessions.md`.
+
 ## 1. Why there is a thin supervisor (and why that's the whole trick)
 
 Claude Code namespaces its credential by `CLAUDE_SECURESTORAGE_CONFIG_DIR` (verified in the 2.1.269 binary, `xSe`/`y_`): the variable moves only the credential store (a `.credentials.json` inside that directory on Linux, a keychain item named `Claude Code-credentials-<sha256(dir)[0:8]>` on macOS), while `~/.claude` (settings, transcripts, plugins) and `~/.claude.json` stay shared, so `--resume` works across stores. An empty namespaced store never falls back to the default login. Hooks, the statusline, and MCP servers inherit the variable. That is the whole mechanism: give every pooled account its own store, set the variable per session, and each session runs on its own account with no credential ever moving.

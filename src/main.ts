@@ -9,6 +9,8 @@ import { runStopFailureHook } from "./entries/stopfailurehook.ts";
 import { runSessionStart } from "./entries/sessionstart.ts";
 import { runCodexSupervisor } from "./entries/codexsupervisor.ts";
 import { runCodexStopHook } from "./entries/codexstophook.ts";
+import { runGrokSupervisor } from "./entries/groksupervisor.ts";
+import { runGrokStopHook } from "./entries/grokstophook.ts";
 import { claude } from "./lib/claude.ts";
 import { codex } from "./lib/codex.ts";
 import { grok } from "./lib/grok.ts";
@@ -44,7 +46,7 @@ function printHelp(): void {
   ${c.cyan("tokenmaxxing check")}      sample the account whose usage figure is oldest (run by the periodic timer)
   ${c.cyan("tokenmaxxing init")}       log in the first account (isolated) + install supervisor & hooks
   ${c.cyan("tokenmaxxing init --codex")}  same for codex: log in the first account, isolated, install codex supervisor + Stop hook
-  ${c.cyan("tokenmaxxing init --grok")}   pool grok Build logins (status-only: no supervisor yet)
+  ${c.cyan("tokenmaxxing init --grok")}   same for grok Build: pool the login, install the grok supervisor + Stop/StopFailure hooks
   ${c.cyan("tokenmaxxing init --opencode-go")}  pool opencode-go API keys (status-only: no supervisor yet)
   ${c.cyan("tokenmaxxing add")}        register an additional account (isolated login)
   ${c.cyan("tokenmaxxing add --codex")}   register an additional codex account (isolated login)
@@ -80,6 +82,9 @@ async function main(): Promise<number> {
   if (argv0 === "codex" || argv[0] === "__supervise-codex") {
     return runCodexSupervisor({ argv: argv[0] === "__supervise-codex" ? argv.slice(1) : argv });
   }
+  if (argv0 === "grok" || argv[0] === "__supervise-grok") {
+    return runGrokSupervisor({ argv: argv[0] === "__supervise-grok" ? argv.slice(1) : argv });
+  }
 
   jsonMode = argv.includes(JSON_FLAG);
   const json = jsonMode;
@@ -103,9 +108,12 @@ async function main(): Promise<number> {
     return 2;
   }
 
-  if ((provider === grok || provider === opencodeGo) && (sub == null || !STATUS_ONLY_COMMANDS.has(sub))) {
-    const flag = provider === grok ? GROK_FLAG : OPENCODE_GO_FLAG;
-    emitError({ json, message: `${flag} applies to ${[...STATUS_ONLY_COMMANDS].join(", ")}, not ${sub ?? "status"}` });
+  if (provider === grok && (sub == null || !CODEX_COMMANDS.has(sub))) {
+    emitError({ json, message: `${GROK_FLAG} applies to ${[...CODEX_COMMANDS].join(", ")}, not ${sub ?? "status"}` });
+    return 2;
+  }
+  if (provider === opencodeGo && (sub == null || !STATUS_ONLY_COMMANDS.has(sub))) {
+    emitError({ json, message: `${OPENCODE_GO_FLAG} applies to ${[...STATUS_ONLY_COMMANDS].join(", ")}, not ${sub ?? "status"}` });
     return 2;
   }
 
@@ -120,6 +128,7 @@ async function main(): Promise<number> {
     case "__stop-failure-hook": return runStopFailureHook();
     case "__session-start": return runSessionStart();
     case "__codex-stop-hook": return runCodexStopHook();
+    case "__grok-stop-hook": return runGrokStopHook();
     case undefined:
     case "status": {
       const extra = args[1];
@@ -165,7 +174,7 @@ async function main(): Promise<number> {
       console.log(`removed ${removed.join(", ")}`);
       if (!out.timerDeactivated) console.log(c.yellow(`⚠ the check job may still be loaded - run: ${timerDeactivationHint()}`));
       if (!out.pathLineRemoved) console.log(c.dim("(no tokenmaxxing PATH line found in the shell rc)"));
-      console.log(`kept: accounts.json, config.json, and every account credential store (claude: stores/ and its keychain items on macOS; codex: codex-stores/) - remove accounts with \`xx rm\` to delete their credentials`);
+      console.log(`kept: accounts.json, config.json, and every account credential store (claude: stores/ and its keychain items on macOS; codex: codex-stores/; grok: grok-stores/) - remove accounts with \`xx rm\` to delete their credentials`);
       return 0;
     }
     case "help":

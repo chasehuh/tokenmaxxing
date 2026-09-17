@@ -8,6 +8,16 @@ tokenmaxxing pools the owner's own Claude Code and Codex logins, starts each ses
 
 No external installed user base, so this is pre-production code: delete old-state compatibility rather than carry it forward.
 
+## This fork (chasehuh/tokenmaxxing)
+
+The desk runs this fork as a source checkout (`~/.local/src/tokenmaxxing`, shim execs bun on `src/main.ts`). Fork-only rules, which override the upstream lines below where they conflict:
+
+- Managed-headless jobs (`docs/auto-swap-long-sessions.md`): `codex exec`, `claude -p`, and `grok -p` are managed - placed on a seat before launch, classified at exit, moved and resumed on a quota refusal, parked with exit 75 and a `jobs/<id>.json` record when the pool is walled. The loop is `src/lib/headless.ts`; the adapters live in each supervisor. `policy.headlessManage=false` restores passthrough.
+- The grok pool is a full provider (usage GET, `grok-stores/<uuid8>/` store homes with symlinks to `~/.grok`, supervisor, Stop + StopFailure hooks). Upstream's status-only grok provider is not enough for the desk.
+- Codex seats may be shared by headless jobs when every usable account already has a session (`policy.headlessShareCodexSeats`, default on). Upstream's strict rule stays for interactive sessions.
+- Tests exist here (`bun test`, `test/`, preload `test/setup.ts`); the upstream "no test code" ruling does not apply to the fork. Keep them hermetic: throwaway `TOKENMAXXING_HOME`, `TOKENMAXXING_CODEX_HOME`, `TOKENMAXXING_GROK_HOME`, mock endpoints on pid-strided ports, never the real keychain.
+- Never `bun add -g tokenmaxxing` on a desk host: the npm package is upstream and shadows the fork. Update = `git pull` in the checkout.
+
 ## Safeguards and machine gotchas
 
 - Resolve the installed entry point before assuming a checkout is the active runtime.

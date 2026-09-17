@@ -3,6 +3,7 @@ title: Honest limitations
 description: The tradeoffs that come with per-session account placement
 ---
 
+- **A headless job resumes empty.** A `codex exec` or `claude -p` job moved after a refusal relaunches with an empty prompt (`policy.headlessResumePrompt`), so the next turn is whatever the caller steers; grok cannot take an empty prompt and resumes with the word `continue`.
 - **A move restarts the process.** A session changes account only by respawning under another store: the supervisor stops claude at the committed turn boundary and resumes the same conversation, so the transcript survives but the process does not, anything typed in that split second is lost, and the first turn on the new account rebuilds its prompt cache (caches are never shared across organizations, and a same-organization move can miss too). See the [measured profile](/switching-profile).
 - **Cached targets.** A move reads cached figures; the periodic check samples one account per tick, so a figure can be as old as one tick per pooled account, and older when its probes keep failing.
 - **Depleted-pause hiccup.** Only a fully depleted pool stops the session for the countdown; anything typed in that split second is lost.

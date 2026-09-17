@@ -18,6 +18,7 @@ export const paths = {
   usageDir: join(TM_HOME, "usage"),
   respawnDir: join(TM_HOME, "respawn"),
   presenceDir: join(TM_HOME, "live"),
+  jobsDir: join(TM_HOME, "jobs"),
   binDir: join(TM_HOME, "bin"),
   supervisorLink: join(TM_HOME, "bin", "claude"),
   logFile: join(TM_HOME, "tokenmaxxing.log"),
@@ -95,9 +96,12 @@ export function codexSeatFromEnv(accountIds: string[], env: Record<string, strin
 const GROK_HOME_DEFAULT = join(HOME, ".grok");
 
 export const grokPaths = {
-  home: env("GROK_HOME", GROK_HOME_DEFAULT),
+  home: env("TOKENMAXXING_GROK_HOME", GROK_HOME_DEFAULT),
+  hooksJson: join(env("TOKENMAXXING_GROK_HOME", GROK_HOME_DEFAULT), "hooks", "tokenmaxxing-grok.json"),
   storesDir: join(TM_HOME, "grok-stores"),
   onboardDir: join(TM_HOME, "grok-onboard"),
+  respawnDir: join(TM_HOME, "grok-respawn"),
+  presenceDir: join(TM_HOME, "grok-live"),
 } as const;
 
 export function grokStoreDirFor(accountId: string): string {
@@ -165,6 +169,10 @@ export function realClaudeBinFromEnv(): string | undefined {
 
 export function realCodexBinFromEnv(): string | undefined {
   return EnvOverrideSchema.parse(process.env.TOKENMAXXING_CODEX_BIN);
+}
+
+export function claudeTranscriptFor(sessionId: string, cwd: string): string {
+  return join(paths.claudeDir, "projects", cwd.replace(/[^a-zA-Z0-9]/g, "-"), `${sessionId}.jsonl`);
 }
 
 export function realGrokBinFromEnv(): string | undefined {

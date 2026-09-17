@@ -5,6 +5,7 @@ import { supervisedSession, writeRespawnMarker } from "../lib/sessions.ts";
 import { loadConfig } from "../lib/state.ts";
 import { classifyEnforcedLimit, findEnforcedRow, parseErrorBody, readTranscriptTail } from "../lib/usage.ts";
 import { paths } from "../lib/paths.ts";
+import { HEADLESS_JOB_ID_ENV } from "../lib/headless.ts";
 import { JsonTextSchema, type EnforcedLimit } from "../lib/types.ts";
 import { log } from "../lib/log.ts";
 import { readStdin } from "./statusline.ts";
@@ -53,7 +54,7 @@ export async function runStopFailureHook(): Promise<number> {
       });
     }
 
-    if (session == null && limit != null) {
+    if (session == null && limit != null && !process.env[HEADLESS_JOB_ID_ENV]) {
       const shim = `${paths.binDir}/claude`;
       log("stopfailure.unsupervised_hint", { sid: stdinSid });
       process.stdout.write(
