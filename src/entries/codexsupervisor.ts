@@ -6,12 +6,23 @@ import { withLock } from "../lib/lock.ts";
 import { LOOP_DIAGNOSIS, MAX_WRAP_DEPTH, UNMANAGED_ENV, WRAP_DEPTH_ENV, WRAP_RATE_MAX, WRAP_RATE_WINDOW_MS, wrapDepth, wrapperEntryRateTripped } from "../lib/claudebin.ts";
 import { resolveRealCodex } from "../lib/codexbin.ts";
 import { ensureCodexStoreHome } from "../lib/codexauth.ts";
-import { pickCodexSeat } from "../lib/codex.ts";
+import { codex, pickCodexSeat, placeCodexSeat } from "../lib/codex.ts";
 import { clearPresence, writePresence } from "../lib/presence.ts";
 import { saveTermios, restoreTermios } from "../lib/tty.ts";
-import { loadAccounts } from "../lib/state.ts";
-import { CodexRespawnMarkerSchema } from "../lib/types.ts";
+import { loadAccounts, loadConfig } from "../lib/state.ts";
+import { CodexRespawnMarkerSchema, type Config } from "../lib/types.ts";
 import { log } from "../lib/log.ts";
+import {
+  HEADLESS_JOB_ID_ENV,
+  codexResumeArgs,
+  codexRolloutRefusal,
+  parseCodexExecLaunch,
+  parseRefusalReset,
+  resolveCodexThreadId,
+  runHeadlessJob,
+  type CodexExecLaunch,
+  type HeadlessAdapter,
+} from "../lib/headless.ts";
 
 export const CODEX_SUPERVISOR_ID_ENV = "TOKENMAXXING_CODEX_SUPERVISOR_ID";
 
@@ -38,6 +49,56 @@ const VALUE_TAKING_ROOT_FLAGS = new Set([
   "-c", "--config", "-i", "--image", "-m", "--model", "--local-provider", "-p", "--profile",
   "-s", "--sandbox", "-a", "--ask-for-approval", "-C", "--cd", "--add-dir", "--enable",
 ]);
+
+export function isHeadlessCodexLaunch(input: { argv: string[] }): boolean {
+  if (process.env.TOKENMAXXING_PROBE) return false;
+  return parseCodexExecLaunch(input.argv) != null;
+}
+
+function codexHeadlessAdapter(input: { real: string; childEnv: Record<string, string | undefined>; launch: CodexExecLaunch; cwd: string; cfg: Config }): HeadlessAdapter {
+  const { real, childEnv, launch, cwd, cfg } = input;
+  return {
+    backend: "codex",
+    provider: codex,
+    place: async ({ wanted, now }) =>
+      withLock(codexPool.lockFile, async () => {
+        const placement = placeCodexSeat(now, wanted, cfg.policy.headlessShareCodexSeats);
+        if (placement.kind === "seat" && placement.shared) log("codexsupervisor.seat_shared", { account: placement.account.id.slice(0, 8) });
+        return placement;
+      }),
+    spawn: async ({ args, jobId, seat }) =>
+      withLock(codexPool.lockFile, async () => {
+        const store = ensureCodexStoreHome(seat.id);
+        const spawned = Bun.spawn([real, ...args], {
+          stdin: "inherit",
+          stdout: "inherit",
+          stderr: "inherit",
+          env: { ...childEnv, [UNMANAGED_ENV]: "1", [HEADLESS_JOB_ID_ENV]: jobId, CODEX_HOME: store },
+        });
+        await recordCodexPresence(spawned, jobId, seat, null);
+        return spawned;
+      }),
+    afterExit: ({ jobId }) => clearPresence({ dir: codexPaths.presenceDir, id: jobId }),
+    knownSessionId: ({ launchArgs }) => {
+      const parsed = parseCodexExecLaunch(launchArgs);
+      return parsed?.mode === "resume" ? parsed.sessionId : null;
+    },
+    resolveSessionId: ({ launchArgs, spawnedAt, now }) => {
+      const parsed = parseCodexExecLaunch(launchArgs);
+      if (parsed?.mode === "resume" && parsed.sessionId != null) return { kind: "id", id: parsed.sessionId };
+      return resolveCodexThreadId({ cwd, since: spawnedAt, now });
+    },
+    refusal: ({ sessionId, resolution, spawnedAt, now }) => {
+      const ids = sessionId != null ? [sessionId] : resolution.kind === "ambiguous" ? resolution.ids : [];
+      for (const id of ids) {
+        const text = codexRolloutRefusal({ threadId: id, since: spawnedAt });
+        if (text != null) return { kind: "weekly", family: null, resetsAt: parseRefusalReset(text, now), text };
+      }
+      return null;
+    },
+    resumeArgs: ({ sessionId }) => codexResumeArgs({ threadId: sessionId, flags: launch.flags, prompt: cfg.policy.headlessResumePrompt }),
+  };
+}
 
 export function shouldManageCodex(input: { argv: string[] }): boolean {
   if (process.env.TOKENMAXXING_PROBE) return false;
@@ -93,6 +154,14 @@ export async function runCodexSupervisor(input: { argv: string[] }): Promise<num
 
   const real = resolveRealCodex();
   const childEnv = { ...process.env, [WRAP_DEPTH_ENV]: String(depth + 1) };
+
+  if (!process.env[UNMANAGED_ENV] && isHeadlessCodexLaunch({ argv })) {
+    const cfg = loadConfig();
+    const launch = parseCodexExecLaunch(argv);
+    if (cfg.policy.headlessManage && launch) {
+      return runHeadlessJob({ adapter: codexHeadlessAdapter({ real, childEnv, launch, cwd: process.cwd(), cfg }), argv, cfg, cwd: process.cwd() });
+    }
+  }
 
   if (!shouldManageCodex({ argv }) || process.env[UNMANAGED_ENV]) {
     const passthroughEnv: Record<string, string | undefined> = { ...childEnv };

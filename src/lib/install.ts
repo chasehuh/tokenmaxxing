@@ -2,7 +2,7 @@ import { accessSync, appendFileSync, constants, existsSync, mkdirSync, readFileS
 import { basename, dirname, join } from "node:path";
 import { escape } from "es-toolkit";
 import { z } from "zod";
-import { codexPaths, codexStoreDirFor, HOME, paths } from "./paths.ts";
+import { codexPaths, codexStoreDirFor, grokPaths, HOME, paths } from "./paths.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { installedBin, installSettings, isOurHookCommand, uninstallSettings } from "./settings.ts";
 import { resolveRealClaude } from "./claudebin.ts";
@@ -212,6 +212,41 @@ export function installCodexSupervisor(): void {
 export function uninstallCodexSupervisor(): void {
   uninstallCodexStopHook();
   if (existsSync(codexSupervisorLink())) rmSync(codexSupervisorLink(), { force: true });
+}
+
+const GROK_STOP_HOOK_SUBCOMMAND = "__grok-stop-hook";
+
+export function grokHookFileContent(): string {
+  const command = `${JSON.stringify(installedBin())} ${GROK_STOP_HOOK_SUBCOMMAND}`;
+  return (
+    JSON.stringify(
+      {
+        description: "tokenmaxxing grok pool: move sessions near the weekly limit",
+        hooks: {
+          Stop: [{ hooks: [{ type: "command", command, timeout: 30 }] }],
+          StopFailure: [{ matcher: "rate_limit", hooks: [{ type: "command", command, timeout: 30 }] }],
+        },
+      },
+      null,
+      2,
+    ) + "\n"
+  );
+}
+
+export function grokSupervisorLink(): string {
+  return join(paths.binDir, "grok");
+}
+
+export function installGrokSupervisor(): void {
+  mkdirSync(paths.binDir, { recursive: true });
+  writeFileAtomic(grokSupervisorLink(), `#!/bin/sh\nexec ${JSON.stringify(installedBin())} __supervise-grok "$@"\n`, 0o755);
+  mkdirSync(dirname(grokPaths.hooksJson), { recursive: true });
+  writeFileAtomic(grokPaths.hooksJson, grokHookFileContent(), 0o644);
+}
+
+export function uninstallGrokSupervisor(): void {
+  rmSync(grokPaths.hooksJson, { force: true });
+  if (existsSync(grokSupervisorLink())) rmSync(grokSupervisorLink(), { force: true });
 }
 
 const LAUNCHD_LABEL = "com.tokenmaxxing.check";
@@ -455,6 +490,7 @@ export function uninstallSupervisor(): UninstallOutcome {
   uninstallSettings();
   const timerDeactivated = uninstallCheckTimer();
   uninstallCodexSupervisor();
+  uninstallGrokSupervisor();
   for (const f of [paths.supervisorLink, join(paths.binDir, "xx"), installedBin()]) {
     if (existsSync(f)) rmSync(f, { force: true });
   }

@@ -5,14 +5,15 @@ import { maxBy } from "es-toolkit";
 import { z } from "zod";
 import { claudePool, paths, storeDirFor } from "../lib/paths.ts";
 import { LOOP_DIAGNOSIS, MAX_WRAP_DEPTH, UNMANAGED_ENV, WRAP_DEPTH_ENV, WRAP_RATE_MAX, WRAP_RATE_WINDOW_MS, resolveRealClaude, wrapDepth, wrapperEntryRateTripped } from "../lib/claudebin.ts";
-import { pickSeat } from "../lib/claude.ts";
+import { claude, pickSeat, placeSeat } from "../lib/claude.ts";
+import { HEADLESS_JOB_ID_ENV, claudeTranscriptRefusal, resolveClaudeSessionId, runHeadlessJob, type HeadlessAdapter } from "../lib/headless.ts";
 import { compactClaudeSession } from "../lib/compact.ts";
 import { withLock } from "../lib/lock.ts";
 import { clearPresence, writePresence } from "../lib/presence.ts";
 import { saveTermios, restoreTermios } from "../lib/tty.ts";
 import { loadSessionFlags, pruneStaleSessions, saveSessionFlags } from "../lib/sessions.ts";
-import { loadAccounts } from "../lib/state.ts";
-import { RespawnMarkerSchema, type Account } from "../lib/types.ts";
+import { loadAccounts, loadConfig } from "../lib/state.ts";
+import { RespawnMarkerSchema, type Account, type Config } from "../lib/types.ts";
 import { log } from "../lib/log.ts";
 
 const NONINTERACTIVE_SUBCMDS = new Set([
@@ -43,6 +44,7 @@ const isUuid = (s: string) => z.uuid().safeParse(s).success;
 
 const AnalysisSchema = z.object({
   manage: z.boolean(),
+  headless: z.boolean(),
   sessionId: z.string().nullable(),
   resumeId: z.string().nullable(),
   continueLatest: z.boolean(),
@@ -56,6 +58,7 @@ export function analyzeArgs(argv: string[]): Analysis {
   let continueLatest = false;
   let streamInput = false;
   let printMode = false;
+  let helpOrVersion = false;
   let invalidSessionArg = false;
   let pickerResume = false;
   let forkSession = false;
@@ -64,7 +67,7 @@ export function analyzeArgs(argv: string[]): Analysis {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "-p" || a === "--print") printMode = true;
-    else if (a === "--version" || a === "-v" || a === "--help" || a === "-h") printMode = true;
+    else if (a === "--version" || a === "-v" || a === "--help" || a === "-h") helpOrVersion = true;
     else if (a === "--session-id") {
       const next = argv[++i] ?? null;
       if (next && isUuid(next)) sessionId = next;
@@ -103,8 +106,10 @@ export function analyzeArgs(argv: string[]): Analysis {
 
   const isSubcmd = firstPositional !== null && NONINTERACTIVE_SUBCMDS.has(firstPositional);
   const forkResume = forkSession && (resumeId !== null || continueLatest);
-  const manage = !printMode && !isSubcmd && !invalidSessionArg && !pickerResume && !forkResume && !process.env.TOKENMAXXING_PROBE;
-  return { manage, sessionId, resumeId, continueLatest, streamInput };
+  const eligible = !isSubcmd && !invalidSessionArg && !pickerResume && !forkResume && !process.env.TOKENMAXXING_PROBE;
+  const manage = !printMode && !helpOrVersion && eligible;
+  const headless = printMode && !helpOrVersion && eligible;
+  return { manage, headless, sessionId, resumeId, continueLatest, streamInput };
 }
 
 export function stripSessionFlags(argv: string[]): string[] {
@@ -324,6 +329,13 @@ export async function runSupervisor(argv: string[]): Promise<number> {
   const info = analyzeArgs(argv);
   const childEnv = { ...process.env, [WRAP_DEPTH_ENV]: String(depth + 1) };
 
+  if (info.headless && !process.env[UNMANAGED_ENV]) {
+    const cfg = loadConfig();
+    if (cfg.policy.headlessManage) {
+      return runHeadlessJob({ adapter: claudeHeadlessAdapter({ real, childEnv, info, argv, cwd: process.cwd(), cfg }), argv, cfg, cwd: process.cwd() });
+    }
+  }
+
   if (!info.manage || process.env[UNMANAGED_ENV]) {
     const passthroughEnv: Record<string, string | undefined> = { ...childEnv };
     delete passthroughEnv.TOKENMAXXING_SUPERVISED;
@@ -455,4 +467,44 @@ export async function runSupervisor(argv: string[]): Promise<number> {
     log("supervisor.exit", { sid, respawns, code: child.exitCode, signal: child.signalCode });
     return child.exitCode ?? (child.signalCode ? 1 : 0);
   }
+}
+
+function claudeHeadlessAdapter(input: { real: string; childEnv: Record<string, string | undefined>; info: Analysis; argv: string[]; cwd: string; cfg: Config }): HeadlessAdapter {
+  const { real, childEnv, info, argv, cwd, cfg } = input;
+  let pinned: string | null = info.sessionId ?? info.resumeId ?? null;
+  const injectSessionId = pinned == null && !info.continueLatest;
+  if (injectSessionId) pinned = crypto.randomUUID();
+  const persistable = stripPositionals(stripSessionFlags(argv));
+  return {
+    backend: "claude",
+    provider: claude,
+    place: async ({ wanted, now }) => withLock(claudePool.lockFile, async () => placeSeat(now, wanted)),
+    spawn: async ({ args, jobId, seat }) =>
+      withLock(claudePool.lockFile, async () => {
+        const first = args === argv && injectSessionId && pinned != null ? [...args, "--session-id", pinned] : args;
+        if (pinned != null) saveSessionFlags(pinned, persistable, cwd);
+        const spawned = Bun.spawn([real, ...first], {
+          stdin: "inherit",
+          stdout: "inherit",
+          stderr: "inherit",
+          env: { ...childEnv, [UNMANAGED_ENV]: "1", [HEADLESS_JOB_ID_ENV]: jobId, CLAUDE_SECURESTORAGE_CONFIG_DIR: storeDirFor(seat.id) },
+        });
+        await recordPresence(spawned, jobId, seat, null);
+        return spawned;
+      }),
+    afterExit: ({ jobId }) => clearPresence({ dir: paths.presenceDir, id: jobId }),
+    knownSessionId: () => pinned,
+    resolveSessionId: ({ spawnedAt, now }) => (pinned != null ? { kind: "id", id: pinned } : resolveClaudeSessionId({ cwd, since: spawnedAt, now })),
+    refusal: ({ sessionId, spawnedAt }) => {
+      if (sessionId == null) return null;
+      const limit = claudeTranscriptRefusal({ sessionId, cwd, since: spawnedAt, switchModels: cfg.policy.switchModels });
+      if (!limit) return null;
+      return { kind: limit.kind, family: limit.kind === "model" ? limit.family : null, resetsAt: limit.resetsAt, text: limit.kind };
+    },
+    resumeArgs: ({ sessionId }) => {
+      pinned = sessionId;
+      saveSessionFlags(sessionId, persistable, cwd);
+      return [...persistable, "--resume", sessionId, cfg.policy.headlessResumePrompt];
+    },
+  };
 }

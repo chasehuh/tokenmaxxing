@@ -2,7 +2,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { verifyRealClaude } from "../lib/claudebin.ts";
 import { checkSettings, installedBin } from "../lib/settings.ts";
 import { checkTimerHealthy, codexStoreHookTrust, findClaudeShadowers, isBinDirAhead, shellRcPath, timerActivationHint } from "../lib/install.ts";
-import { claudePool, codexPool, paths } from "../lib/paths.ts";
+import { claudePool, codexPool, grokPaths, grokPool, paths } from "../lib/paths.ts";
+import { grokSupervisorLink } from "../lib/install.ts";
+import { readGrokStoreIssuer } from "../lib/grok.ts";
 import { loadAccounts, loadConfig } from "../lib/state.ts";
 import { readStore } from "../lib/credstore.ts";
 import { codexIdentityOf, readCodexStoreAuth } from "../lib/codexauth.ts";
@@ -86,6 +88,23 @@ export async function cmdDoctor(): Promise<number> {
     const trust = codexStoreHookTrust(a.id);
     if (trust === "untrusted") warn(`${a.label} (codex): Stop hook not trusted for this seat - open a supervised codex session on it, run /hooks, and trust it, or auto-switching stays inert there`);
     else if (trust === "unknown") note(`${a.label} (codex): hook trust unknown (no hooks.json or config.toml yet - launch a supervised session once, then trust via /hooks)`);
+  }
+
+  const gidx = loadAccounts(grokPool);
+  if (gidx.accounts.length > 0) {
+    check(existsSync(grokSupervisorLink()), "grok supervisor wrapper present", "run `tokenmaxxing init --grok`");
+    check(existsSync(grokPaths.hooksJson), "grok Stop/StopFailure hook file present", "run `tokenmaxxing init --grok`");
+    for (const a of gidx.accounts) {
+      let issuer = null;
+      let issuerErr: string | null = null;
+      try {
+        issuer = readGrokStoreIssuer(a.id);
+      } catch (e) {
+        issuerErr = (e instanceof Error ? e.message : String(e)).slice(0, 100);
+      }
+      check(issuer != null, `grok store credential present for ${a.label}`, issuerErr ?? `run \`tokenmaxxing auth --grok ${a.label}\``);
+      if (a.needsReauth) check(false, `${a.label} (grok) needs re-auth`, `run \`tokenmaxxing auth --grok ${a.label}\` to re-login`);
+    }
   }
 
   if (existsSync(paths.setupTokensJson)) {

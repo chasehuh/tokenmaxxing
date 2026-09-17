@@ -9,7 +9,7 @@ import { withLock } from "./lock.ts";
 import { log } from "./log.ts";
 import { claudeTierLabel, describeIdentity, fetchTokenIdentity, isDeadCredential, InvalidGrantError } from "./oauth.ts";
 import { claudePool, paths, sampleDirFor, seatFromEnv, storeDirFor } from "./paths.ts";
-import { pickBest, pickEarliestReset, thresholdBars, type PickCtx } from "./picker.ts";
+import { isExhausted, pickBest, pickEarliestReset, thresholdBars, type PickCtx } from "./picker.ts";
 import { seatCounts } from "./presence.ts";
 import type { Observation, Provider, SampleReport } from "./provider.ts";
 import { foldTee, probeAccountUsage, teeObservation } from "./sample.ts";
@@ -125,14 +125,33 @@ async function storeUsable(a: Account): Promise<boolean> {
   }
 }
 
-export function pickSeat(now: number): Account | null {
+function seatCandidates(now: number): { accounts: Account[]; ctx: PickCtx } {
   const cfg = loadConfig();
   const idx = loadAccounts(claudePool);
   let dirty = false;
   for (const a of idx.accounts) dirty = foldTee(a) || dirty;
   if (dirty) saveAccounts(claudePool, idx);
-  const ctx: PickCtx = { now, thresholds: thresholdBars(cfg), currentId: null, families: cfg.policy.switchModels, seats: presence() };
-  return pickBest(idx.accounts, ctx) ?? pickEarliestReset(idx.accounts, ctx)?.account ?? null;
+  return { accounts: idx.accounts, ctx: { now, thresholds: thresholdBars(cfg), currentId: null, families: cfg.policy.switchModels, seats: presence() } };
+}
+
+export function pickSeat(now: number): Account | null {
+  const { accounts, ctx } = seatCandidates(now);
+  return pickBest(accounts, ctx) ?? pickEarliestReset(accounts, ctx)?.account ?? null;
+}
+
+export type SeatPlacement = { kind: "seat"; account: Account } | { kind: "wait"; until: number; account: Account | null } | { kind: "none" };
+
+export function placeSeat(now: number, wantedId: string | null): SeatPlacement {
+  const { accounts, ctx } = seatCandidates(now);
+  if (wantedId != null) {
+    const wanted = accounts.find((a) => a.id === wantedId && a.needsReauth !== true && !isExhausted(a, { ...ctx, currentId: wantedId }));
+    if (wanted) return { kind: "seat", account: wanted };
+  }
+  const best = pickBest(accounts, ctx);
+  if (best) return { kind: "seat", account: best };
+  const soonest = pickEarliestReset(accounts, ctx);
+  if (soonest) return { kind: "wait", until: soonest.availableAt, account: soonest.account };
+  return { kind: "none" };
 }
 
 async function removeCredentials(a: Account): Promise<void> {

@@ -124,6 +124,12 @@ export const ConfigSchema = z
         usagePollTtlMs: z.number().int().positive().default(90_000),
         maxWaitMs: z.number().int().positive().default(3_600_000),
         checkIntervalMs: z.number().int().min(10_000).default(60_000),
+        headlessManage: z.boolean().default(true),
+        headlessMaxRespawns: z.number().int().nonnegative().default(5),
+        headlessMinRespawnGapMs: z.number().int().nonnegative().default(10_000),
+        headlessMaxWaitMs: z.number().int().positive().default(3_600_000),
+        headlessResumePrompt: z.string().default(""),
+        headlessShareCodexSeats: z.boolean().default(true),
       })
       .prefault({}),
   })
@@ -234,6 +240,32 @@ export const CodexRespawnMarkerSchema = z.object({
   accountId: z.string(),
   sessionId: z.string().nullable(),
   ts: z.number(),
+});
+
+export const GrokIssuerSchema = z.looseObject({
+  auth_mode: z.string().optional(),
+  key: z.string(),
+  refresh_token: z.string(),
+  user_id: z.string(),
+  principal_id: z.string().optional(),
+  principal_type: z.string().optional(),
+  email: z.string().nullish(),
+  expires_at: z.union([z.string(), z.number()]).nullish(),
+});
+export type GrokIssuer = z.infer<typeof GrokIssuerSchema>;
+
+export const GrokStopStdinSchema = z.looseObject({
+  hookEventName: z.string().optional(),
+  sessionId: z.string().optional(),
+  reason: z.string().optional(),
+  error: z.string().optional(),
+});
+
+export const GrokRespawnMarkerSchema = z.object({
+  accountId: z.string(),
+  sessionId: z.string().nullable(),
+  ts: z.number(),
+  waitUntil: z.number().nullable(),
 });
 
 export const ErrnoSchema = z.object({ code: z.string() });

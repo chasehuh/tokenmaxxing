@@ -296,7 +296,7 @@ export async function cmdStatus(opts: { json?: boolean; cached?: boolean } = {})
     renderPool(codex, codexReport, `codex  (${count({ n: codexReport.accounts.length, noun: "account" })})`, Date.now(), cfg.policy.usagePollTtlMs);
   }
   if (grokReport.accounts.length > 0) {
-    renderPool(grok, grokReport, `grok  (${count({ n: grokReport.accounts.length, noun: "account" })}, status-only)`, Date.now(), cfg.policy.usagePollTtlMs);
+    renderPool(grok, grokReport, `grok  (${count({ n: grokReport.accounts.length, noun: "account" })})`, Date.now(), cfg.policy.usagePollTtlMs);
   }
   if (opencodeGoReport.accounts.length > 0) {
     renderPool(opencodeGo, opencodeGoReport, `opencode-go  (${count({ n: opencodeGoReport.accounts.length, noun: "account" })}, status-only)`, Date.now(), cfg.policy.usagePollTtlMs);

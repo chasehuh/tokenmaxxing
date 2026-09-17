@@ -25,6 +25,10 @@ A running codex process holds one in-memory auth manager and explicitly refuses 
 
 tokenmaxxing handles this with a codex supervisor shim: the Stop hook runs the same pace-pressure decision against the same two bars at each turn boundary, and when it swaps, it writes a marker that makes the supervisor SIGTERM the session at the committed boundary and relaunch `codex resume <session-id>` under the target's store, transcript intact. A marker the supervisor cannot parse stops the session instead of resuming it. Because every codex switch is a visible restart, the automatic codex decision moves only once the session's account is at or over a bar. There is no depleted-pool countdown for codex - nothing can pause a codex session - so a fully depleted codex pool stays put. When the session's account is at or over a bar, the hook first compacts the thread on that account through `codex app-server` (`thread/resume`, then `thread/compact/start`), so the resumed session on the fresh account starts from the summary rather than re-uploading the whole history; see [Compaction before a move](/switching#compaction-before-a-move).
 
+## Headless `codex exec`
+
+`codex exec` runs as a managed job on this fork: the shim places it on a pooled account before launch (the best usable account with no live session, else the least-loaded usable one), and when the server refuses a turn on a quota limit it walls that seat, moves the job to the best sibling, and relaunches `codex exec resume <thread> <flags> ""` under the sibling's store. When every account is walled the job waits in place for a reset within `policy.headlessMaxWaitMs`, otherwise it exits 75 with a resumable record under `jobs/`. Details: `docs/auto-swap-long-sessions.md`.
+
 Other codex-specific mechanics:
 
 - Usage is read from a free authenticated GET against codex's own rate-limit endpoint (the same call the CLI's `/status` makes): percentages plus absolute epoch reset times, aggregate windows and per-model caps alike. Window classification is duration-driven, never position-driven, because current plans may have no 5-hour window at all and the weekly window sits in the primary slot.

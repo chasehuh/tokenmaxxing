@@ -229,6 +229,29 @@ export function pickCodexSeat(now: number, wantedId: string | null = null): Acco
   return pickBest(usable, ctx) ?? pickEarliestReset(idx.accounts.filter((a) => a.needsReauth !== true && !present.has(a.id)), ctx)?.account ?? null;
 }
 
+export type CodexSeatPlacement = { kind: "seat"; account: Account; shared: boolean } | { kind: "wait"; until: number; account: Account | null } | { kind: "none" };
+
+export function placeCodexSeat(now: number, wantedId: string | null, share: boolean): CodexSeatPlacement {
+  const idx = loadAccounts(codexPool);
+  const ctx = codexPickCtx(now, null);
+  const present = seatCounts(codexPaths.presenceDir);
+  const usable = idx.accounts.filter((a) => a.needsReauth !== true && !isExhausted(a, ctx));
+  if (wantedId != null) {
+    const wanted = usable.find((a) => a.id === wantedId);
+    if (wanted) return { kind: "seat", account: wanted, shared: present.has(wanted.id) };
+  }
+  const free = pickBest(usable.filter((a) => !present.has(a.id)), ctx);
+  if (free) return { kind: "seat", account: free, shared: false };
+  if (share) {
+    const leastLoaded = Math.min(...usable.map((a) => present.get(a.id) ?? 0));
+    const shared = pickBest(usable.filter((a) => (present.get(a.id) ?? 0) === leastLoaded), ctx);
+    if (shared) return { kind: "seat", account: shared, shared: true };
+  }
+  const soonest = pickEarliestReset(idx.accounts.filter((a) => a.needsReauth !== true && (share || !present.has(a.id))), ctx);
+  if (soonest) return { kind: "wait", until: soonest.availableAt, account: soonest.account };
+  return { kind: "none" };
+}
+
 export const codex: Provider = {
   name: "codex",
   flag: " --codex",
