@@ -1,8 +1,10 @@
-// `tokenmaxxing ls` - compact list of pooled accounts, claude then codex.
+// `tokenmaxxing ls` - compact list of pooled accounts, claude then codex then grok.
 
 import { loadAccounts } from "../lib/state.ts";
 import { loadCodexAccounts } from "../lib/codexstate.ts";
 import { liveCodexAccountId } from "../lib/codexsample.ts";
+import { loadGrokAccounts } from "../lib/grokstate.ts";
+import { liveGrokAccountId } from "../lib/groksample.ts";
 import { c, claudeTierLabel } from "./render.ts";
 
 export function cmdLs(): number {
@@ -28,6 +30,23 @@ export function cmdLs(): number {
     console.log();
     console.log(c.dim("codex"));
     for (const account of codex.accounts) {
+      const active = account.accountId === liveId;
+      const marker = active ? c.green("●") : c.dim("○");
+      const flags: string[] = [];
+      if (active) flags.push(c.green("active"));
+      if (account.needsReauth) flags.push(c.red("needs-reauth"));
+      const tag = flags.length ? ` ${flags.join(" ")}` : "";
+      console.log(`${marker} ${c.bold(account.label)}${tag}`);
+      console.log(`  ${c.dim(`${account.planType ?? "?"}, id ${account.accountId.slice(0, 8)}`)}`);
+    }
+  }
+
+  const grok = loadGrokAccounts();
+  if (grok.accounts.length > 0) {
+    const liveId = liveGrokAccountId();
+    console.log();
+    console.log(c.dim("grok"));
+    for (const account of grok.accounts) {
       const active = account.accountId === liveId;
       const marker = active ? c.green("●") : c.dim("○");
       const flags: string[] = [];

@@ -4,9 +4,14 @@
 import { existsSync, readFileSync } from "node:fs";
 import { verifyRealClaude } from "../lib/claudebin.ts";
 import { checkSettings, installedBin } from "../lib/settings.ts";
-import { checkTimerHealthy, findClaudeShadowers, isBinDirAhead, shellRcPath, timerActivationHint } from "../lib/install.ts";
-import { paths } from "../lib/paths.ts";
+import { checkTimerHealthy, findClaudeShadowers, grokSupervisorLink, isBinDirAhead, shellRcPath, timerActivationHint } from "../lib/install.ts";
+import { grokPaths, paths } from "../lib/paths.ts";
 import { loadAccounts, loadConfig } from "../lib/state.ts";
+import { loadGrokAccounts } from "../lib/grokstate.ts";
+import { liveGrokAccountId } from "../lib/groksample.ts";
+import { verifyRealGrok } from "../lib/grokbin.ts";
+import { readParkedGrokAuth } from "../lib/grokauth.ts";
+import { grokPathShadowers } from "./grokinit.ts";
 import { readItem, liveTarget, parkedTarget } from "../lib/credstore.ts";
 import { isAccessTokenExpiring, fetchTokenOrg } from "../lib/oauth.ts";
 import { CredentialBlobSchema, type RolesResponse } from "../lib/types.ts";
@@ -82,6 +87,45 @@ export async function cmdDoctor(): Promise<number> {
     // existence checks cannot - the 2026-07-12 recursive-spawn incident.
     const fail = verifyRealClaude(cfg.claudeBin);
     check(fail === null, "claudeBin launches the real claude", fail ?? undefined);
+  }
+
+  // Grok checks only when the grok pool or its shim exists: a claude-only
+  // install must stay green with zero new findings (issue #1).
+  const grokIdx = loadGrokAccounts();
+  if (grokIdx.accounts.length > 0 || existsSync(grokSupervisorLink())) {
+    console.log();
+    console.log(c.dim("grok"));
+    check(existsSync(grokSupervisorLink()), "grok supervisor wrapper present", "run `tokenmaxxing init --grok`");
+    check(!!cfg.grokBin && existsSync(cfg.grokBin), "real grok binary resolved", "set grokBin in config.json (or re-run `tokenmaxxing init --grok`)");
+    if (cfg.grokBin && existsSync(cfg.grokBin)) {
+      // Behavioral: the pin must answer --version without re-entering the
+      // wrapper - the same poisoned-pin class as the claudeBin incident.
+      const fail = verifyRealGrok({ bin: cfg.grokBin });
+      check(fail === null, "grokBin launches the real grok", fail ?? undefined);
+    }
+    const hookOk = existsSync(grokPaths.hooksJson) && readFileSync(grokPaths.hooksJson, "utf8").includes("__grok-stop-hook");
+    check(hookOk, `grok hook file declares the Stop hook (${grokPaths.hooksJson})`, "run `tokenmaxxing init --grok`");
+    // PATH resolution is load-bearing and commonly hostile here: the grok
+    // installer's ~/.grok/bin and a ~/.local/bin/grok symlink both shadow
+    // tokenmaxxing/bin on real machines, silently bypassing the supervisor.
+    for (const shadow of grokPathShadowers()) {
+      check(false, `\`grok\` resolves to the supervisor on PATH`, `${shadow} wins resolution - retarget it (ln -sf ${grokSupervisorLink()} <link>) or reorder PATH`);
+    }
+    if (grokIdx.accounts.length > 0) {
+      check(!!grokIdx.activeAccountId, "an active grok account is set");
+      // Offline identity agreement: the live blob's own user_id vs the label.
+      // liveGrokAccountId throws on an unreadable blob (fail loud, like every
+      // grok loader); null just means no login is installed right now.
+      const liveId = liveGrokAccountId();
+      check(liveId != null, "live grok credential readable", "run `grok login` or `tokenmaxxing switch --grok`");
+      if (liveId != null && grokIdx.activeAccountId != null) {
+        check(liveId === grokIdx.activeAccountId, "live grok credential identity matches the active label", "run `tokenmaxxing switch --grok` to realign");
+      }
+      for (const account of grokIdx.accounts) {
+        check(readParkedGrokAuth({ credFile: account.credFile }) != null, `parked grok credential present for ${account.label}`, "re-add it with `tokenmaxxing add --grok`");
+        if (account.needsReauth) check(false, `${account.label} needs re-auth`, "re-add it with `tokenmaxxing add --grok`");
+      }
+    }
   }
 
   // Warnings only: an interactive alias/function can shadow or bypass the

@@ -2,7 +2,7 @@
 
 **Automatic Claude Code account switching.** Run `claude` exactly as you always do; when the active account nears its usage limit, tokenmaxxing swaps the credential to a fresher account at a safe turn boundary and your session keeps running on it - no restart, same conversation. Works across many concurrent sessions. Only when the whole pool is at its limit does anything visible happen: a countdown that auto-resumes at the soonest reset, when that reset falls within `policy.maxWaitMs` (default 1h - a longer wait stays put rather than parking your terminal for hours).
 
-> **Scope:** Claude Code only, macOS and Linux. It pools **subscription** accounts (Pro/Max), not API keys.
+> **Scope:** Claude Code, OpenAI Codex, and Grok Build (SuperGrok), macOS and Linux. It pools **subscription** logins (Pro/Max, ChatGPT, SuperGrok), not API keys.
 
 ```
 $ claude
@@ -63,18 +63,21 @@ claude                  # use claude as always
 |---|---|
 | `tokenmaxxing init` | import the current account + install supervisor & hooks |
 | `tokenmaxxing init --codex` | same for codex: import login, install codex supervisor + Stop hook |
+| `tokenmaxxing init --grok` | same for grok: import the SuperGrok login, install grok supervisor + Stop/StopFailure hooks (auto-trusted) |
 | `tokenmaxxing add` | register an additional account (isolated login, harvested into the pool) |
 | `tokenmaxxing add --codex` | register an additional codex account (isolated login) |
+| `tokenmaxxing add --grok` | register an additional grok account (isolated login) |
 | `tokenmaxxing auth [sel \| --all]` | reauthenticate a pooled account in place: bare lists the pool (emails shown) and asks which; a selector targets one account and tells you the email to sign in with; `--all` walks every needs-reauth account one by one |
 | `tokenmaxxing switch [sel]` | switch the claude pool: bare picks the best account greedily (no-op when the current one wins), a selector targets one |
 | `tokenmaxxing switch --codex [sel]` | switch the codex pool (takes effect on the next codex start) |
+| `tokenmaxxing switch --grok [sel]` | switch the grok pool (running sessions hot-reload it on their next API call) |
 | `tokenmaxxing ls` | list pooled accounts |
 | `tokenmaxxing status` | accounts with 5h / weekly usage bars, active + exhausted-until-reset |
-| `tokenmaxxing status --force` | additionally ping every account (one tiny haiku request each) so all 5h session timers start now, then sample fresh |
+| `tokenmaxxing status --force` | additionally ping every claude account (one tiny haiku request each) so all 5h session timers start now, then sample fresh (grok is never pinged: it has no session window to start) |
 | `tokenmaxxing watch [seconds]` | live status: re-render every N seconds (default 120, floor 30; never pings) |
 | `tokenmaxxing config` | effective config with sources; `get`/`set`/`unset` dotted keys, `tidy` prunes unknown keys |
 | `tokenmaxxing doctor` | verify the supervisor + settings entries survived |
-| `tokenmaxxing rename [--codex] <sel> <label>` / `rm [--codex] <sel>` | manage the pool (`--codex` targets the codex pool: one email can hold both a claude and a codex account) |
+| `tokenmaxxing rename [--codex\|--grok] <sel> <label>` / `rm [--codex\|--grok] <sel>` | manage the pool (`--codex`/`--grok` target those pools: one email can hold accounts in all three) |
 | `tokenmaxxing uninstall` | remove supervisor + settings entries (accounts/credentials kept) |
 
 ## How switching decides
@@ -146,6 +149,20 @@ codex                       # use codex as always
 Codex mechanics differ from Claude Code in one hard way: a running codex process refuses a credential swapped to a different account, so **a restart is the switch**. The installed Stop hook runs the same greedy pace-pressure decision at each turn boundary (usage read free from codex's own rate-limit endpoint: percentages plus absolute reset times, weekly aggregate and per-model caps alike); when it swaps, the supervisor relaunches `codex resume <session-id>` on the fresh account with the transcript intact. `tokenmaxxing switch --codex [sel]` does it manually, `status`/`watch`/`ls` show both pools.
 
 Two codex-specific facts worth knowing: codex does not run hooks it has not been told to trust, so after `init --codex` you must open codex once and trust the tokenmaxxing Stop hook via `/hooks` (auto-switching is inert until then); and codex has no cross-process lock on `auth.json`, so tokenmaxxing serializes all of its own credential writes behind its own lock and swaps only at idle turn boundaries.
+
+## Grok Build support
+
+The same pooling works for Grok Build (xAI's coding CLI) across your own SuperGrok OIDC logins:
+
+```sh
+tokenmaxxing init --grok   # pin the real grok binary, import your current login, install the grok supervisor & hooks
+tokenmaxxing add --grok    # log in another account, isolated - your primary login is untouched
+grok                       # use grok as always
+```
+
+Grok sits between the other two mechanically. Like Claude Code, a running grok **hot-reloads** a swapped `~/.grok/auth.json` on its next API call, so a swap carries every default-home session with it and nothing restarts; the restart path exists only as a fallback (a rate-limited turn respawns `grok --resume <session-id>` onto the fresh account, in case grok's config watcher skipped the reload) and for the depleted-pool countdown. Like Codex, credentials are a plaintext file harvested and parked losslessly per account - but grok also flocks its own `auth.json.lock`, which tokenmaxxing holds across every live-file write, so nothing can rotate the credential mid-swap.
+
+Usage is one free GET against grok's billing endpoint (`?format=credits`): a single **weekly** used% plus its reset time. There is no 5h session window, so the grok pool runs the same greedy pace-pressure policy on the weekly bar alone, and `status --force` never pings grok (there is nothing to start and nothing free to spend). Hooks land as a sibling file under `~/.grok/hooks/`, which grok always trusts - no `/hooks` step, auto-switching is live immediately after `init --grok`. One PATH caveat: the grok installer's `~/.grok/bin` (and a `~/.local/bin/grok` symlink) commonly sit ahead of tokenmaxxing's bin dir; `init --grok` and `doctor` detect that and print the exact retarget command rather than editing the installer's launcher (the next `grok update` would clobber it back).
 
 ## Honest limitations
 

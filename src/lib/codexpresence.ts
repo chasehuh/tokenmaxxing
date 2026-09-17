@@ -21,6 +21,11 @@ const PresenceSchema = z.object({
   accountId: z.string(),
   pid: z.number(),
   startedAt: z.string(),
+  /** a managed-headless job (`codex exec`): guards its account exactly like a
+   *  supervised TUI (never a swap target, never a parked-token refresh), but
+   *  has no Stop boundary, so the reconcile sweep must not signal it - it
+   *  follows the seat by itself at its next refusal (docs/auto-swap-long-sessions.md §4.5). */
+  headless: z.boolean().optional(),
 });
 
 /** `pid` should be the CODEX CHILD's pid when known (the supervisor passes
@@ -29,7 +34,7 @@ const PresenceSchema = z.object({
  *  running and rotating the account's token - un-benching a live account for
  *  samplers and the picker (closing-review catch). Defaults to process.pid
  *  for callers that ARE the session-owning process (tests, future uses). */
-export function writeCodexPresence(input: { supervisorId: string; accountId: string; pid?: number }): void {
+export function writeCodexPresence(input: { supervisorId: string; accountId: string; pid?: number; headless?: boolean }): void {
   const pid = input.pid ?? process.pid;
   const startedAt = pidStartTime(pid);
   // The pid must be ps-visible; a null here means ps broke or the process
@@ -38,7 +43,7 @@ export function writeCodexPresence(input: { supervisorId: string; accountId: str
   mkdirSync(codexPaths.presenceDir, { recursive: true });
   writeFileAtomic(
     join(codexPaths.presenceDir, input.supervisorId),
-    JSON.stringify(PresenceSchema.parse({ accountId: input.accountId, pid, startedAt })),
+    JSON.stringify(PresenceSchema.parse({ accountId: input.accountId, pid, startedAt, ...(input.headless ? { headless: true } : {}) })),
   );
 }
 
@@ -46,7 +51,7 @@ export function clearCodexPresence(input: { supervisorId: string }): void {
   rmSync(join(codexPaths.presenceDir, input.supervisorId), { force: true });
 }
 
-const LivingPresenceSchema = z.object({ supervisorId: z.string(), accountId: z.string() });
+const LivingPresenceSchema = z.object({ supervisorId: z.string(), accountId: z.string(), headless: z.boolean() });
 export type LivingPresence = z.infer<typeof LivingPresenceSchema>;
 
 /** Every LIVING supervised session (pid + start-time identity match), as
@@ -92,7 +97,7 @@ export function livingCodexPresences(): LivingPresence[] {
       rmSync(file, { force: true });
       continue;
     }
-    living.push(LivingPresenceSchema.parse({ supervisorId: name, accountId: parsed.data.accountId }));
+    living.push(LivingPresenceSchema.parse({ supervisorId: name, accountId: parsed.data.accountId, headless: parsed.data.headless === true }));
   }
   return living;
 }

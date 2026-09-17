@@ -18,12 +18,14 @@ process.env.TOKENMAXXING_CLAUDE_SETTINGS = join(base, "settings.json");
 // worktrees are this repo's standard flow) once collided on fixed 8791/8792
 // (closing-review catch). Test files must read these ports from the env URLs,
 // never hardcode them.
-// stride 2 so adjacent pids cannot collide: with +1 alone, run A's codex
-// port equaled run B's oauth port whenever pidB = pidA + 1 (closing-review
-// catch reopening the very collision this scheme fixes).
-const mockPort = 20000 + ((process.pid * 2) % 30000);
+// stride 3 (one slot per mock server) so adjacent pids cannot collide: with a
+// smaller stride, run A's last port equals run B's first whenever
+// pidB = pidA + 1 (closing-review catch reopening the very collision this
+// scheme fixes; the stride grew 2 → 3 when the grok billing mock joined).
+const mockPort = 20000 + ((process.pid * 3) % 30000);
 export const MOCK_OAUTH_PORT = mockPort;
 export const MOCK_CODEX_PORT = mockPort + 1;
+export const MOCK_GROK_PORT = mockPort + 2;
 process.env.TOKENMAXXING_OAUTH_TOKEN_URL = `http://127.0.0.1:${MOCK_OAUTH_PORT}/token`;
 process.env.TOKENMAXXING_OAUTH_ROLES_URL = `http://127.0.0.1:${MOCK_OAUTH_PORT}/roles`;
 // Sandbox the darwin keychain identifiers too: performSwap resolves the LIVE
@@ -45,6 +47,8 @@ mkdirSync(process.env.TOKENMAXXING_SYSTEMD_USER_DIR, { recursive: true });
 process.env.TOKENMAXXING_CODEX_HOME = join(base, "codexhome");
 process.env.TOKENMAXXING_CODEX_TOKEN_URL = `http://127.0.0.1:${MOCK_CODEX_PORT}/codex-token`;
 process.env.TOKENMAXXING_CODEX_USAGE_URL = `http://127.0.0.1:${MOCK_CODEX_PORT}/codex-usage`;
+process.env.TOKENMAXXING_GROK_HOME = join(base, "grokhome");
+process.env.TOKENMAXXING_GROK_BILLING_URL = `http://127.0.0.1:${MOCK_GROK_PORT}/grok-billing`;
 process.env.NO_COLOR = "1";
 
 // exposed for tests that want the sandbox root

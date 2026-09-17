@@ -16,6 +16,8 @@ import { paths } from "../src/lib/paths.ts";
 import { loadAccounts, loadDepletedWait, loadModelUsage, loadUsage, saveAccounts, saveDepletedWait, saveLastSwapAt } from "../src/lib/state.ts";
 import { writeItem, parkedTarget, liveTarget, deleteItem } from "../src/lib/credstore.ts";
 import type { Account } from "../src/lib/types.ts";
+import { writeJobRecord } from "../src/lib/headless.ts";
+import { pidStartTime } from "../src/lib/proc.ts";
 
 const D = 86_400_000;
 const fakeClaude = join(paths.home, "fake-claude");
@@ -505,5 +507,83 @@ describe("evaluateAndMaybeSwap headless snapshot handling", () => {
     });
     const d = await evaluateAndMaybeSwap();
     expect(d.reason).toBe("all-depleted"); // parked, NOT last-drop-hold
+  });
+});
+
+describe("evaluateAndMaybeSwap headless boundaries", () => {
+
+  function greedyFixture(): void {
+    const D2 = 2 * D;
+    installFakeClaude(50, Date.now() + D2);
+    installFixtures([
+      poolAccount("B", {
+        lastUsage: { fiveHour: { usedPercentage: 5, resetsAt: null }, sevenDay: { usedPercentage: 10, resetsAt: Date.now() + D2 } },
+        lastUsageAt: Date.now(),
+      }),
+    ]);
+    writeUsageJson({
+      fiveHour: { usedPercentage: 55, resetsAt: Date.now() + 3_600_000 },
+      sevenDay: { usedPercentage: 60, resetsAt: Date.now() + D2 },
+      model: { id: "claude-3-5-sonnet-20241022", display: "Sonnet" },
+    });
+  }
+
+  function liveClaudeJob(): void {
+    writeJobRecord({
+      backend: "claude", jobId: "job-live", cwd: "/w", sessionId: null, accountId: "org-A", launchArgs: ["-p", "x"],
+      respawns: 0, state: "running", waitUntil: null, pid: process.pid, startedAt: pidStartTime(process.pid), ts: Date.now(),
+    });
+  }
+
+  beforeEach(() => {
+    clearState();
+    rmSync(paths.jobsDir, { recursive: true, force: true });
+  });
+
+  test("a greedy swap is suppressed while a managed-headless claude job runs; the job's own spawn gate still converges", async () => {
+    greedyFixture();
+    liveClaudeJob();
+    const d = await evaluateAndMaybeSwap();
+    expect(d.swapped).toBe(false);
+    expect(d.reason).toBe("greedy-suppressed-headless-jobs");
+    // the spawn boundary is the job's own pre-launch gate: greedy proceeds (proven by the loud missing-credential throw)
+    await expect(evaluateAndMaybeSwap(Date.now(), false, { boundary: "spawn" })).rejects.toThrow(/no parked credential/);
+    // a codex job does not suppress the claude seat
+    rmSync(paths.jobsDir, { recursive: true, force: true });
+    writeJobRecord({
+      backend: "codex", jobId: "job-codex", cwd: "/w", sessionId: null, accountId: "acct-X", launchArgs: ["exec"],
+      respawns: 0, state: "running", waitUntil: null, pid: process.pid, startedAt: pidStartTime(process.pid), ts: Date.now(),
+    });
+    await expect(evaluateAndMaybeSwap()).rejects.toThrow(/no parked credential/);
+  });
+
+  test("policy.headlessGreedyWithJobs=true restores today's greedy behavior", async () => {
+    greedyFixture();
+    liveClaudeJob();
+    writeFileSync(paths.configJson, JSON.stringify({ claudeBin: fakeClaude, policy: { switchModels: ["fable"], headlessGreedyWithJobs: true } }));
+    await expect(evaluateAndMaybeSwap()).rejects.toThrow(/no parked credential/);
+  });
+
+  test("a refusal takes the hard path off an under-bar seat, ignoring the cooldown", async () => {
+    greedyFixture();
+    saveLastSwapAt(Date.now() - 1000);
+    // under every bar and inside the cooldown: the stop path holds...
+    expect((await evaluateAndMaybeSwap()).reason).toBe("post-swap-cooldown");
+    // ...the refusal path swaps away regardless (proven by the missing-credential throw on B)
+    await expect(evaluateAndMaybeSwap(Date.now(), false, { boundary: "refusal" })).rejects.toThrow(/no parked credential/);
+  });
+
+  test("a refusal with no other account never holds or waits on the refused seat: all-depleted, no waitUntil", async () => {
+    installFakeClaude(50, Date.now() + 2 * D);
+    installFixtures([]);
+    writeUsageJson({
+      fiveHour: { usedPercentage: 20, resetsAt: Date.now() + 3_600_000 },
+      sevenDay: { usedPercentage: 20, resetsAt: Date.now() + 2 * D },
+      model: { id: "claude-3-5-sonnet-20241022", display: "Sonnet" },
+    });
+    const d = await evaluateAndMaybeSwap(Date.now(), false, { boundary: "refusal" });
+    expect(d.swapped).toBe(false);
+    expect(d.reason).toBe("all-depleted");
+    expect(d.waitUntil).toBeUndefined();
   });
 });

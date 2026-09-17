@@ -895,3 +895,68 @@ describe("codex supervisor management decision", () => {
     expect(shouldManageCodex({ argv: ["-C", "/tmp"] })).toBe(true);
   });
 });
+
+describe("codex decide boundaries (managed-headless)", () => {
+  test("timer: a seat with a session on it is refreshed but never moved", async () => {
+    const old = nowMs() - 3600_000;
+    seedPool({ accounts: [account("A", { weekly: window({ used: 99, resetInMs: 86_400_000 }), sampledAt: old }), account("B", { weekly: window({ used: 5, resetInMs: 86_400_000 }) })], activeId: "acct-A" });
+    writeLiveCodexAuth({ auth: authBlob("A") });
+    writeParkedCodexAuth({ credFile: codexCredItemFor("acct-B"), auth: authBlob("B") });
+    usageBody = () => ({ ...DEFAULT_USAGE_BODY(), rate_limit: { primary_window: { used_percent: 99, limit_window_seconds: week, reset_at: Math.floor(Date.now() / 1000) + 86_400 } } });
+    writeCodexPresence({ supervisorId: "job-1", accountId: "acct-A", pid: process.pid, headless: true });
+    const held = await evaluateAndMaybeSwapCodex({ boundary: "timer" });
+    expect(held.swapped).toBe(false);
+    expect(held.reason).toBe("seat-in-use");
+    // the sample still landed: the snapshot is fresh now
+    expect(loadCodexAccounts().accounts.find((a) => a.accountId === "acct-A")!.lastUsageAt).toBeGreaterThan(old);
+    // an idle seat is moved by the timer like any other boundary
+    rmSync(codexPaths.presenceDir, { recursive: true, force: true });
+    const moved = await evaluateAndMaybeSwapCodex({ boundary: "timer" });
+    expect(moved.swapped).toBe(true);
+    expect(moved.account?.accountId).toBe("acct-B");
+  });
+
+  test("refusal: no cooldown, no engagement gate, hard path even when the re-sample fails", async () => {
+    seedPool({ accounts: [account("A", { weekly: window({ used: 10, resetInMs: 86_400_000 }) }), account("B", { weekly: window({ used: 5, resetInMs: 86_400_000 }) })], activeId: "acct-A" });
+    writeLiveCodexAuth({ auth: authBlob("A") });
+    writeParkedCodexAuth({ credFile: codexCredItemFor("acct-B"), auth: authBlob("B") });
+    saveCodexLastSwapAt({ ts: nowMs() - 1000 });
+    usageBody = () => "not the wire shape"; // the sample throws; the refusal must still move the seat
+    expect((await evaluateAndMaybeSwapCodex({})).reason).toBe("post-swap-cooldown");
+    const d = await evaluateAndMaybeSwapCodex({ boundary: "refusal" });
+    expect(d.swapped).toBe(true);
+    expect(d.account?.accountId).toBe("acct-B");
+    expect(codexIdentityOf({ auth: readLiveCodexAuth()! }).accountId).toBe("acct-B");
+  });
+
+  test("refusal with nothing usable reports the soonest sibling recovery, never the refused seat's own cache", async () => {
+    const twoHours = 2 * 3600_000;
+    seedPool({
+      accounts: [
+        account("A", { weekly: window({ used: 10, resetInMs: 60_000 }) }), // the refused seat "recovers" in 1m per its stale cache - ignored
+        account("B", { weekly: window({ used: 99, resetInMs: twoHours }) }),
+        account("C", { weekly: window({ used: 99, resetInMs: 3 * twoHours }) }),
+        account("D", { weekly: window({ used: 99, resetInMs: 1000 }), needsReauth: true }),
+      ],
+      activeId: "acct-A",
+    });
+    writeLiveCodexAuth({ auth: authBlob("A") });
+    const d = await evaluateAndMaybeSwapCodex({ boundary: "refusal" });
+    expect(d.swapped).toBe(false);
+    expect(d.reason).toBe("all-depleted");
+    expect(d.waitUntil).toBeGreaterThan(nowMs() + twoHours - 10_000);
+    expect(d.waitUntil).toBeLessThan(nowMs() + twoHours + 10_000);
+    // the stop boundary keeps its old contract: no waitUntil at all
+    expect((await evaluateAndMaybeSwapCodex({})).waitUntil).toBeUndefined();
+  });
+
+  test("a headless presence benches its account for targeting but is never sent a reconcile signal", async () => {
+    seedPool({ accounts: [account("A", { weekly: window({ used: 5, resetInMs: 86_400_000 }) }), account("B", { weekly: window({ used: 5, resetInMs: 86_400_000 }) })], activeId: "acct-A" });
+    writeLiveCodexAuth({ auth: authBlob("A") });
+    writeCodexPresence({ supervisorId: "job-on-B", accountId: "acct-B", pid: process.pid, headless: true });
+    expect(presentCodexAccountIds().has("acct-B")).toBe(true);
+    expect(targetableCodexAccounts({ accounts: loadCodexAccounts().accounts, activeAccountId: "acct-A" }).map((a) => a.accountId)).toEqual(["acct-A"]);
+    await evaluateAndMaybeSwapCodex({});
+    expect(existsSync(join(codexPaths.reconcileDir, "job-on-B"))).toBe(false);
+  });
+});

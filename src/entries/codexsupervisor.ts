@@ -17,6 +17,21 @@ import { LOOP_DIAGNOSIS, MAX_WRAP_DEPTH, UNMANAGED_ENV, WRAP_DEPTH_ENV, WRAP_RAT
 import { resolveRealCodex } from "../lib/codexbin.ts";
 import { clearCodexPresence, writeCodexPresence } from "../lib/codexpresence.ts";
 import { liveCodexAccountId } from "../lib/codexsample.ts";
+import { evaluateAndMaybeSwapCodex } from "../lib/codexdecide.ts";
+import { isCodexExhausted } from "../lib/codexpick.ts";
+import { loadCodexAccounts } from "../lib/codexstate.ts";
+import { loadConfig } from "../lib/state.ts";
+import { effectiveBars } from "../lib/picker.ts";
+import {
+  HEADLESS_JOB_ID_ENV,
+  codexResumeArgs,
+  codexRolloutRefusal,
+  parseCodexExecLaunch,
+  resolveCodexThreadId,
+  runHeadlessJob,
+  type CodexExecLaunch,
+  type HeadlessAdapter,
+} from "../lib/headless.ts";
 import { saveTermios, restoreTermios } from "../lib/tty.ts";
 import { CodexRespawnMarkerSchema } from "../lib/types.ts";
 import { log } from "../lib/log.ts";
@@ -55,6 +70,14 @@ const VALUE_TAKING_ROOT_FLAGS = new Set([
   "-s", "--sandbox", "-a", "--ask-for-approval", "-C", "--cd", "--add-dir", "--enable",
 ]);
 
+/** A managed-headless launch: `codex exec [resume|fork] ...` (never help /
+ *  version / `exec review`). Passthrough and interactive classification are
+ *  unchanged; this is the third class docs/auto-swap-long-sessions.md §4.1 adds. */
+export function isHeadlessCodexLaunch(input: { argv: string[] }): boolean {
+  if (process.env.TOKENMAXXING_PROBE) return false;
+  return parseCodexExecLaunch(input.argv) != null;
+}
+
 export function shouldManageCodex(input: { argv: string[] }): boolean {
   if (process.env.TOKENMAXXING_PROBE) return false;
   let firstPositional: string | null = null;
@@ -68,6 +91,137 @@ export function shouldManageCodex(input: { argv: string[] }): boolean {
     if (!arg.startsWith("-") && firstPositional === null) firstPositional = arg;
   }
   return firstPositional === null || !NONINTERACTIVE_SUBCMDS.has(firstPositional);
+}
+
+/** Spawn the real codex on the live seat and declare that seat RUNNING.
+ *  Read + presence-write + spawn run under the codex FLOCK (closing-review
+ *  catch): unlocked, a swap could land between the read and the child's
+ *  auth.json read, seating the child on the NEW account while presence named
+ *  the old one for the session's whole life - un-benching the running account
+ *  for samplers and the picker. Under the flock no swap can interleave until
+ *  after the spawn; the residual window (child startup vs a swap acquiring the
+ *  lock immediately after) is sub-ms in practice against a swap's
+ *  network-bound critical section.
+ *
+ *  Presence pins the CHILD's pid, written after the spawn (still inside the
+ *  flock): the session IS the codex process, and pinning the supervisor's pid
+ *  let a SIGKILLed supervisor prune the presence while its orphaned codex
+ *  kept rotating the account's token (closing-review catch). Brief retries
+ *  cover ps visibility lag on a just-spawned pid. FAIL CLOSED on final
+ *  failure (PR #36 review catch): a session running without presence is
+ *  exactly the unprotected state presence exists to prevent - its account
+ *  would look swappable and samplable - so kill the just-spawned child
+ *  (nothing is in flight yet) and surface the error instead of running
+ *  unprotected. Shared by the TUI loop and the managed-headless loop
+ *  (`headless` marks the presence so the reconcile sweep skips it). */
+async function spawnCodexSeated(input: {
+  real: string;
+  args: string[];
+  env: Record<string, string | undefined>;
+  supervisorId: string;
+  savedTermios: string | null;
+  headless?: boolean;
+}): Promise<{ child: ReturnType<typeof Bun.spawn>; accountId: string | null }> {
+  return withLock(codexPaths.lockFile, async () => {
+    const spawnAccountId = liveCodexAccountId();
+    const spawned = Bun.spawn([input.real, ...input.args], {
+      stdin: "inherit",
+      stdout: "inherit",
+      stderr: "inherit",
+      env: input.env,
+    });
+    if (spawnAccountId) {
+      for (let attempt = 0; attempt < 10; attempt++) {
+        try {
+          writeCodexPresence({ supervisorId: input.supervisorId, accountId: spawnAccountId, pid: spawned.pid, headless: input.headless });
+          break;
+        } catch (e) {
+          // a child that already exited needs no presence (its absence is
+          // correct) and must keep its own exit result - the normal exit
+          // path handles it (PR #36 second-round catch)
+          if (spawned.exitCode !== null || spawned.signalCode !== null) break;
+          if (attempt === 9) {
+            log("codexsupervisor.presence_failed", { err: e instanceof Error ? e.message : String(e) });
+            spawned.kill();
+            // the child may have entered raw mode during the retries: await
+            // its death and restore the terminal before surfacing (PR #36
+            // second-round catch)
+            await spawned.exited;
+            restoreTermios(input.savedTermios);
+            throw new Error("could not write the codex presence file - refusing to run an unprotected session (its account would look like a swap target)");
+          }
+          await Bun.sleep(100);
+        }
+      }
+    }
+    return { child: spawned, accountId: spawnAccountId };
+  });
+}
+
+/** The managed-headless adapter for `codex exec` (docs/auto-swap-long-sessions.md
+ *  §4). Codex cannot hot-adopt, so the spawn gate is the free switch point and
+ *  a refusal is answered by `exec resume <thread> "" ` on the fresh seat. */
+function codexHeadlessAdapter(input: { real: string; childEnv: Record<string, string | undefined>; launch: CodexExecLaunch; cwd: string }): HeadlessAdapter {
+  const { real, childEnv, launch, cwd } = input;
+  return {
+    backend: "codex",
+    liveAccountId: () => liveCodexAccountId(),
+    spawnGate: async () => {
+      const d = await evaluateAndMaybeSwapCodex({ boundary: "spawn" });
+      return { swapped: d.swapped, reason: d.reason };
+    },
+    spawn: async ({ args, jobId }) => {
+      // UNMANAGED for the whole subtree: an agent inside the job running
+      // `codex exec` (or claude/grok) reaches the real binary as a plain
+      // child instead of nesting a second job around the outer one.
+      const { child, accountId } = await spawnCodexSeated({
+        real,
+        args,
+        env: { ...childEnv, [UNMANAGED_ENV]: "1", [HEADLESS_JOB_ID_ENV]: jobId },
+        supervisorId: jobId,
+        savedTermios: null,
+        headless: true,
+      });
+      return { child, accountId };
+    },
+    afterExit: ({ jobId }) => clearCodexPresence({ supervisorId: jobId }),
+    knownSessionId: ({ launchArgs }) => {
+      const parsed = parseCodexExecLaunch(launchArgs);
+      return parsed?.mode === "resume" ? parsed.sessionId : null;
+    },
+    resolveSessionId: ({ launchArgs, spawnedAt, now }) => {
+      // `exec resume <id>` names its thread; a fresh exec (or a fork, which
+      // mints a NEW id) is learned from the rollout codex wrote for this cwd.
+      const parsed = parseCodexExecLaunch(launchArgs);
+      if (parsed?.mode === "resume" && parsed.sessionId != null) return { kind: "id", id: parsed.sessionId };
+      return resolveCodexThreadId({ cwd, since: spawnedAt, now });
+    },
+    refusalEvidence: ({ sessionId, resolution, spawnedAt }) => {
+      // an ambiguous fresh thread still swaps the seat when ANY candidate
+      // rollout shows the refusal (the loop then parks rather than resuming
+      // a sibling's transcript).
+      const ids = sessionId != null ? [sessionId] : resolution.kind === "ambiguous" ? resolution.ids : [];
+      for (const id of ids) {
+        const found = codexRolloutRefusal({ threadId: id, since: spawnedAt });
+        if (found != null) return found;
+      }
+      return null;
+    },
+    refusalDecision: async ({ refusedAccountId }) => {
+      // a sibling may already have moved the seat: resume on it without a
+      // second swap (the codex analog of decide.ts's raced-already-swapped).
+      const live = liveCodexAccountId();
+      if (live != null && refusedAccountId != null && live !== refusedAccountId) {
+        const seat = loadCodexAccounts().accounts.find((account) => account.accountId === live);
+        if (seat && seat.needsReauth !== true && !isCodexExhausted({ account: seat, thresholds: effectiveBars(loadConfig()), now: Date.now() })) {
+          return { swapped: false, account: seat.label, waitUntil: null, reason: "seat-moved" };
+        }
+      }
+      const d = await evaluateAndMaybeSwapCodex({ boundary: "refusal" });
+      return { swapped: d.swapped, account: d.account?.label ?? null, waitUntil: d.waitUntil ?? null, reason: d.reason };
+    },
+    resumeArgs: ({ sessionId }) => codexResumeArgs({ threadId: sessionId, flags: launch.flags }),
+  };
 }
 
 /** Entry point: `codex ...args` through the on-PATH shim. */
@@ -91,6 +245,18 @@ export async function runCodexSupervisor(input: { argv: string[] }): Promise<num
 
   const real = resolveRealCodex();
   const childEnv = { ...process.env, [WRAP_DEPTH_ENV]: String(depth + 1) };
+
+  // Managed-headless: `codex exec` under a spawn gate + refusal classifier
+  // (docs/auto-swap-long-sessions.md). Checked before the passthrough arm so
+  // the unmanaged sentinel still wins (a nested exec inside a job or an SDK
+  // turn is a plain child).
+  if (!process.env[UNMANAGED_ENV] && isHeadlessCodexLaunch({ argv })) {
+    const cfg = loadConfig();
+    const launch = parseCodexExecLaunch(argv);
+    if (cfg.policy.headlessManage && launch) {
+      return runHeadlessJob({ adapter: codexHeadlessAdapter({ real, childEnv, launch, cwd: process.cwd() }), argv, cfg, cwd: process.cwd() });
+    }
+  }
 
   // The unmanaged-zone sentinel forces passthrough regardless of argv, exactly
   // like the claude shim: a serve turn's agent running `codex exec` must reach
@@ -142,49 +308,12 @@ export async function runCodexSupervisor(input: { argv: string[] }): Promise<num
     // can interleave until after the spawn; the residual window (child
     // startup vs a swap acquiring the lock immediately after) is sub-ms in
     // practice against a swap's network-bound critical section.
-    const child = await withLock(codexPaths.lockFile, async () => {
-      const spawnAccountId = liveCodexAccountId();
-      const spawned = Bun.spawn([real, ...launchArgs], {
-        stdin: "inherit",
-        stdout: "inherit",
-        stderr: "inherit",
-        env: { ...childEnv, [CODEX_SUPERVISOR_ID_ENV]: supervisorId },
-      });
-      // Presence pins the CHILD's pid, written after the spawn (still inside
-      // the flock): the session IS the codex process, and pinning this
-      // supervisor's pid let a SIGKILLed supervisor prune the presence while
-      // its orphaned codex kept rotating the account's token (closing-review
-      // catch). Brief retries cover ps visibility lag on a just-spawned pid.
-      // FAIL CLOSED on final failure (PR #36 review catch): a session running
-      // without presence is exactly the unprotected state presence exists to
-      // prevent - its account would look swappable and samplable - so kill
-      // the just-spawned child (nothing is in flight yet) and surface the
-      // error instead of running unprotected.
-      if (spawnAccountId) {
-        for (let attempt = 0; attempt < 10; attempt++) {
-          try {
-            writeCodexPresence({ supervisorId, accountId: spawnAccountId, pid: spawned.pid });
-            break;
-          } catch (e) {
-            // a child that already exited needs no presence (its absence is
-            // correct) and must keep its own exit result - the normal exit
-            // path below handles it (PR #36 second-round catch)
-            if (spawned.exitCode !== null || spawned.signalCode !== null) break;
-            if (attempt === 9) {
-              log("codexsupervisor.presence_failed", { err: e instanceof Error ? e.message : String(e) });
-              spawned.kill();
-              // the child may have entered raw mode during the retries: await
-              // its death and restore the terminal before surfacing (PR #36
-              // second-round catch)
-              await spawned.exited;
-              restoreTermios(savedTermios);
-              throw new Error("could not write the codex presence file - refusing to run an unprotected session (its account would look like a swap target)");
-            }
-            await Bun.sleep(100);
-          }
-        }
-      }
-      return spawned;
+    const { child } = await spawnCodexSeated({
+      real,
+      args: launchArgs,
+      env: { ...childEnv, [CODEX_SUPERVISOR_ID_ENV]: supervisorId },
+      supervisorId,
+      savedTermios,
     });
 
     let done = false;

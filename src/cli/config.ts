@@ -9,7 +9,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { isPlainObject } from "es-toolkit";
 import { get, set, unset } from "es-toolkit/compat";
 import { z } from "zod";
-import { paths, realClaudeBinFromEnv, realCodexBinFromEnv } from "../lib/paths.ts";
+import { paths, realClaudeBinFromEnv, realCodexBinFromEnv, realGrokBinFromEnv } from "../lib/paths.ts";
 import { ConfigFileSchema, loadConfig, mergeConfigFile } from "../lib/state.ts";
 import { writeFileAtomic } from "../lib/atomic.ts";
 import { c } from "./render.ts";
@@ -24,11 +24,17 @@ export const KNOWN_KEYS = [
   "hardThresholds.weekly",
   "claudeBin",
   "codexBin",
+  "grokBin",
   "policy.projectionMargin",
   "policy.greedySessionFloor",
   "policy.switchModels",
   "policy.usagePollTtlMs",
   "policy.maxWaitMs",
+  "policy.headlessManage",
+  "policy.headlessGreedyWithJobs",
+  "policy.headlessMaxRespawns",
+  "policy.headlessMinRespawnGapMs",
+  "policy.headlessMaxWaitMs",
 ] as const;
 
 const RawFileSchema = z.record(z.string(), z.unknown());
@@ -63,6 +69,7 @@ function unknownFileKeys(raw: Record<string, unknown>): string[] {
 function envSourceFor(key: string): string | null {
   if (key === "claudeBin" && realClaudeBinFromEnv()) return "TOKENMAXXING_CLAUDE_BIN";
   if (key === "codexBin" && realCodexBinFromEnv()) return "TOKENMAXXING_CODEX_BIN";
+  if (key === "grokBin" && realGrokBinFromEnv()) return "TOKENMAXXING_GROK_BIN";
   return null;
 }
 

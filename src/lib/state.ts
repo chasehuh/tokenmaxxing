@@ -3,7 +3,7 @@
 import { existsSync, readFileSync, rmSync, statSync, utimesSync } from "node:fs";
 import { isEqual } from "es-toolkit";
 import { z } from "zod";
-import { paths, realClaudeBinFromEnv, realCodexBinFromEnv } from "./paths.ts";
+import { paths, realClaudeBinFromEnv, realCodexBinFromEnv, realGrokBinFromEnv } from "./paths.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import {
   AccountsIndexSchema,
@@ -30,10 +30,25 @@ const DEFAULT_CONFIG: Config = {
   hardThresholds: { session: 100, weekly: 100 },
   claudeBin: "",
   codexBin: "",
+  grokBin: "",
   // per-model weekly caps exist only for Sonnet and Fable (no Opus-only quota,
   // per the user 2026-07-12), and only Fable's is worth switching on.
   // greedySessionFloor 50: half a session window buys the swap (user 2026-07-16).
-  policy: { projectionMargin: 0, greedySessionFloor: 50, switchModels: ["fable"], usagePollTtlMs: 90_000, maxWaitMs: 3_600_000 },
+  policy: {
+    projectionMargin: 0,
+    greedySessionFloor: 50,
+    switchModels: ["fable"],
+    usagePollTtlMs: 90_000,
+    maxWaitMs: 3_600_000,
+    // managed-headless defaults (docs/auto-swap-long-sessions.md §4-5, owner
+    // decisions 2026-09-17): on, greedy suppressed while jobs run, 5 respawns
+    // at least 10s apart, wait in place up to an hour else park (exit 75).
+    headlessManage: true,
+    headlessGreedyWithJobs: false,
+    headlessMaxRespawns: 5,
+    headlessMinRespawnGapMs: 10_000,
+    headlessMaxWaitMs: 3_600_000,
+  },
 };
 
 /** Percent-of-window values: out-of-range bars make every account read as
@@ -50,6 +65,7 @@ export const ConfigFileSchema = z
     hardThresholds: z.object({ session: PercentSchema, weekly: PercentSchema }).partial(),
     claudeBin: z.string(),
     codexBin: z.string(),
+    grokBin: z.string(),
     policy: z
       .object({
         projectionMargin: PercentSchema,
@@ -57,6 +73,11 @@ export const ConfigFileSchema = z
         switchModels: z.array(z.string()),
         usagePollTtlMs: z.number().int().positive(),
         maxWaitMs: z.number().int().positive(),
+        headlessManage: z.boolean(),
+        headlessGreedyWithJobs: z.boolean(),
+        headlessMaxRespawns: z.number().int().nonnegative(),
+        headlessMinRespawnGapMs: z.number().int().nonnegative(),
+        headlessMaxWaitMs: z.number().int().positive(),
       })
       .partial(),
   })
@@ -87,10 +108,16 @@ export function mergeConfigFile(p: z.infer<typeof ConfigFileSchema>): MergeOutco
   cfg.hardThresholds.weekly = p.hardThresholds?.weekly ?? cfg.hardThresholds.weekly;
   cfg.claudeBin = p.claudeBin ?? cfg.claudeBin;
   cfg.codexBin = p.codexBin ?? cfg.codexBin;
+  cfg.grokBin = p.grokBin ?? cfg.grokBin;
   cfg.policy.projectionMargin = p.policy?.projectionMargin ?? cfg.policy.projectionMargin;
   cfg.policy.greedySessionFloor = p.policy?.greedySessionFloor ?? cfg.policy.greedySessionFloor;
   cfg.policy.usagePollTtlMs = p.policy?.usagePollTtlMs ?? cfg.policy.usagePollTtlMs;
   cfg.policy.maxWaitMs = p.policy?.maxWaitMs ?? cfg.policy.maxWaitMs;
+  cfg.policy.headlessManage = p.policy?.headlessManage ?? cfg.policy.headlessManage;
+  cfg.policy.headlessGreedyWithJobs = p.policy?.headlessGreedyWithJobs ?? cfg.policy.headlessGreedyWithJobs;
+  cfg.policy.headlessMaxRespawns = p.policy?.headlessMaxRespawns ?? cfg.policy.headlessMaxRespawns;
+  cfg.policy.headlessMinRespawnGapMs = p.policy?.headlessMinRespawnGapMs ?? cfg.policy.headlessMinRespawnGapMs;
+  cfg.policy.headlessMaxWaitMs = p.policy?.headlessMaxWaitMs ?? cfg.policy.headlessMaxWaitMs;
   if (p.policy?.switchModels) {
     cfg.policy.switchModels = p.policy.switchModels.map((s) => s.toLowerCase());
   }
@@ -99,6 +126,8 @@ export function mergeConfigFile(p: z.infer<typeof ConfigFileSchema>): MergeOutco
   if (envBin) cfg.claudeBin = envBin;
   const envCodexBin = realCodexBinFromEnv();
   if (envCodexBin) cfg.codexBin = envCodexBin;
+  const envGrokBin = realGrokBinFromEnv();
+  if (envGrokBin) cfg.grokBin = envGrokBin;
   const merged = ConfigSchema.safeParse(cfg);
   if (!merged.success) {
     // per-field values passed but the merged whole is unusable (the
@@ -140,7 +169,7 @@ export function loadConfig(): Config {
  *  default changes as stale explicit values and misreports every `xx config`
  *  source as "file" (closing-review catch; the sparse-overrides contract is
  *  config.ts's header). Throws on a corrupt file, like loadConfig. */
-export function pinBinOverride(input: { key: "claudeBin" | "codexBin"; bin: string }): void {
+export function pinBinOverride(input: { key: "claudeBin" | "codexBin" | "grokBin"; bin: string }): void {
   let raw: Record<string, unknown> = {};
   if (existsSync(paths.configJson)) {
     raw = z.record(z.string(), z.unknown()).parse(JSON.parse(readFileSync(paths.configJson, "utf8")));
