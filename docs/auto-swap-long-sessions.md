@@ -116,26 +116,102 @@ The status-only upstream provider became a full one:
 
 ## 5. Init / migration on the desk hosts (owner step)
 
-Per-account stores are new state. Nothing migrates the 1.8 pool (`accounts.json` v1, keychain
-`tokenmaxxing-cred-*` items, `codex-creds/`, `grok-creds/`): upstream forbids credential
-copies between stores, and this branch changes no credential. The desk keeps running the old
-checkout until the owner re-onboards on each host:
+Per-account stores are new state. Nothing migrates the 1.8 pool (`accounts.json` version 1,
+the `tokenmaxxing-cred-*` keychain items, `codex-creds/`, `grok-creds/`): credential copies
+between stores are forbidden upstream and this branch changes no credential. Every `init` /
+`add` is an interactive browser or device login, so the owner runs them; everything else was
+prepared on 2026-09-17:
+
+| | Laptop | Mini |
+|---|---|---|
+| Ported tree | `~/.local/src/tokenmaxxing-v150` at `d0fdd1b`, deps installed, `bun test` 36/36, typecheck clean | same path, same SHA, same results |
+| Current install | source checkout of the 1.8 lineage (`grok-build-pool`, owner's uncommitted grok work inside - left untouched) | bun global `tokenmaxxing@1.10.0` (upstream npm) plus a post-exec script that mirrors the live keychain credential to `~/.claude/.credentials.json` |
+| Old state | v1 pools: 6 Claude, 5 Codex, 3 grok | v1 pools: 6 Claude, 5 Codex; no grok pool |
+| Config | bins only (compatible) | ladder-style `thresholds.session: [75,85,95]` - rejected by the v1.50 schema, must be rewritten (below) |
+| Keychain from the worker launch context | GUI shell: works | SSH session (`sume-bg-remote`): `security` read **and** write fail with error 36 ("User interaction is not allowed") even with the GUI session logged in |
+
+The new install is taken from the ported clone, so the old checkout keeps the owner's
+uncommitted work and the old install stays runnable until the cutover.
+
+### 5.1 Laptop
 
 ```sh
-cd ~/.local/src/tokenmaxxing && git switch managed-headless-v150 && bun install
-bun run src/main.ts init            # first Claude account (isolated /login) + shim + hooks + timer
-bun run src/main.ts add             # each further Claude account
-bun run src/main.ts init --codex    # first Codex account (device auth) + codex shim + Stop hook
-bun run src/main.ts add --codex     # each further Codex account; then /hooks trust once per seat
-bun run src/main.ts init --grok     # pools the live ~/.grok login + grok shim + hooks
-bun run src/main.ts add --grok      # each further grok account
-tokenmaxxing doctor && tokenmaxxing status
+# 0. quiet moment: running workers keep their old code; only new launches are affected
+cd ~/.local/src/tokenmaxxing-v150 && git pull --ff-only && bun install --frozen-lockfile && bun run typecheck && bun test
+
+# 1. list the accounts to sign in with (labels only, from the v1 index)
+python3 -c 'import json;[print(p, [a["label"] for a in json.load(open(f"/Users/$USER/.config/tokenmaxxing/{p}"))["accounts"]]) for p in ("accounts.json","codex-accounts.json","grok-accounts.json")]'
+
+# 2. retire the v1 state (index + parked copies; the keychain items stay until you delete them)
+cd ~/.config/tokenmaxxing && mkdir -p retired-v1 && mv accounts.json codex-accounts.json grok-accounts.json lastswap.json codex-lastswap.json grok-lastswap.json usage.json model-usage.json spawnrate.json codex-creds grok-creds sample respawn grok-respawn codex-live grok-live retired-v1/ 2>/dev/null; ls
+
+# 3. Claude, first account: an isolated claude opens - run /login as that account; it closes itself
+cd ~/.local/src/tokenmaxxing-v150 && bun run src/main.ts init
+#    success: "imported current account", "installed claude supervisor + statusLine/Stop/StopFailure/SessionStart hooks",
+#    "periodic check timer active"; `cat ~/.config/tokenmaxxing/bin/tokenmaxxing` names .../tokenmaxxing-v150/src/main.ts
+# 4. Claude, each further account (repeat per label from step 1)
+tokenmaxxing add
+# 5. Codex, first account: device auth (open the URL, enter the code, sign in as that account)
+tokenmaxxing init --codex
+# 6. Codex, each further account
+tokenmaxxing add --codex
+# 7. grok: pools the live ~/.grok login without a browser, installs the grok shim + hook file
+tokenmaxxing init --grok
+# 8. grok, each further account (browser login in the isolated home)
+tokenmaxxing add --grok
+# 9. verify
+tokenmaxxing doctor && tokenmaxxing status && which claude codex grok && ~/.cstack/src/install.sh | grep -A2 "tokenmaxxing (local"
 ```
 
-Every `init`/`add` is an interactive browser or device login, so no agent runs them. The old
-state directory can be cleared afterwards (`accounts.json`, `codex-accounts.json`,
-`grok-accounts.json` are version 1 and fail the version-2 schema loudly on first read; the
-old keychain items and `*-creds/` directories are the owner's to delete).
+`doctor` will warn that the codex Stop hook is untrusted per seat; `exec` jobs do not use
+it. The old `tokenmaxxing-cred-*` keychain items and `retired-v1/` are the owner's to delete
+once `status` shows every account sampling.
+
+### 5.2 Mini
+
+Codex and grok stores are plain files under `~/.config/tokenmaxxing/`, so those pools work
+from SSH-launched workers unchanged. **The Claude pool does not, as ported**: the per-account
+store is a keychain item, and the Mini's SSH context cannot read one (verified 2026-09-17:
+`security find-generic-password -w` and `add-generic-password` both exit 36). Today's
+install survives only because the post-exec script copies the one live credential into
+`~/.claude/.credentials.json`, the file Claude Code falls back to; v1.50's `init` rewrites
+the shim without that line. Pick one before onboarding Claude there:
+
+- **A.** Launch Mini workers from the GUI security session instead of the SSH session
+  (a `launchctl`-submitted agent or `launchctl asuser` dispatch in `sume-bg-remote`), so the
+  keychain is readable and no credential is ever copied. Cleanest; a cstack change.
+- **B.** Keep the mirror hack, per store: after each GUI-context refresh, copy every
+  `stores/<uuid8>` keychain item to `stores/<uuid8>/.credentials.json`. Credential copies,
+  same grant in two places - the failure mode upstream documents.
+- **C.** Onboard Codex and grok now, leave the Mini Claude pool on the old install until A
+  lands.
+
+The non-interactive part, whichever option:
+
+```sh
+ssh <mini>            # then in a login shell
+cd ~/.local/src/tokenmaxxing-v150 && git pull --ff-only && bun install --frozen-lockfile && bun run typecheck && bun test
+# retire the v1 state and the ladder config (the old global stays installed but unreferenced once init rewrites the shim)
+cd ~/.config/tokenmaxxing && mkdir -p retired-v1 && cp config.json retired-v1/config.json && mv accounts.json codex-accounts.json lastswap.json codex-lastswap.json usage.json model-usage.json codex-creds sample respawn retired-v1/ 2>/dev/null; true
+cat > ~/.config/tokenmaxxing/config.json <<'EOF'
+{
+  "claudeBin": "/Users/chasehuh/.bun/bin/claude",
+  "codexBin": "/Users/chasehuh/.local/node/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex",
+  "thresholds": { "session": 90, "weekly": 98 }
+}
+EOF
+# Codex first (file stores, SSH-safe): device auth per account
+cd ~/.local/src/tokenmaxxing-v150 && bun run src/main.ts init --codex && tokenmaxxing add --codex   # repeat add per account
+# grok, if the Mini's grok login should be pooled
+tokenmaxxing init --grok
+# Claude: only after A/B/C is decided; then `bun run src/main.ts init` + `tokenmaxxing add` per account IN THE GUI SESSION (Screen Sharing), never over ssh
+# after the Claude init the shim no longer runs the mirror script; re-add it only under option B
+tokenmaxxing doctor && tokenmaxxing status && bun remove -g tokenmaxxing
+```
+
+Note `init --codex` on a host without a Claude pool installs no check timer (upstream:
+only the Claude `init` installs it); the Mini's existing `com.tokenmaxxing.check` agent keeps
+pointing at the old global until the Claude `init` rewrites it.
 
 ## 6. Tests
 
