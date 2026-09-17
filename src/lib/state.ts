@@ -34,7 +34,21 @@ const DEFAULT_CONFIG: Config = {
   // per-model weekly caps exist only for Sonnet and Fable (no Opus-only quota,
   // per the user 2026-07-12), and only Fable's is worth switching on.
   // greedySessionFloor 50: half a session window buys the swap (user 2026-07-16).
-  policy: { projectionMargin: 0, greedySessionFloor: 50, switchModels: ["fable"], usagePollTtlMs: 90_000, maxWaitMs: 3_600_000 },
+  policy: {
+    projectionMargin: 0,
+    greedySessionFloor: 50,
+    switchModels: ["fable"],
+    usagePollTtlMs: 90_000,
+    maxWaitMs: 3_600_000,
+    // managed-headless defaults (docs/auto-swap-long-sessions.md §4-5, owner
+    // decisions 2026-09-17): on, greedy suppressed while jobs run, 5 respawns
+    // at least 10s apart, wait in place up to an hour else park (exit 75).
+    headlessManage: true,
+    headlessGreedyWithJobs: false,
+    headlessMaxRespawns: 5,
+    headlessMinRespawnGapMs: 10_000,
+    headlessMaxWaitMs: 3_600_000,
+  },
 };
 
 /** Percent-of-window values: out-of-range bars make every account read as
@@ -59,6 +73,11 @@ export const ConfigFileSchema = z
         switchModels: z.array(z.string()),
         usagePollTtlMs: z.number().int().positive(),
         maxWaitMs: z.number().int().positive(),
+        headlessManage: z.boolean(),
+        headlessGreedyWithJobs: z.boolean(),
+        headlessMaxRespawns: z.number().int().nonnegative(),
+        headlessMinRespawnGapMs: z.number().int().nonnegative(),
+        headlessMaxWaitMs: z.number().int().positive(),
       })
       .partial(),
   })
@@ -94,6 +113,11 @@ export function mergeConfigFile(p: z.infer<typeof ConfigFileSchema>): MergeOutco
   cfg.policy.greedySessionFloor = p.policy?.greedySessionFloor ?? cfg.policy.greedySessionFloor;
   cfg.policy.usagePollTtlMs = p.policy?.usagePollTtlMs ?? cfg.policy.usagePollTtlMs;
   cfg.policy.maxWaitMs = p.policy?.maxWaitMs ?? cfg.policy.maxWaitMs;
+  cfg.policy.headlessManage = p.policy?.headlessManage ?? cfg.policy.headlessManage;
+  cfg.policy.headlessGreedyWithJobs = p.policy?.headlessGreedyWithJobs ?? cfg.policy.headlessGreedyWithJobs;
+  cfg.policy.headlessMaxRespawns = p.policy?.headlessMaxRespawns ?? cfg.policy.headlessMaxRespawns;
+  cfg.policy.headlessMinRespawnGapMs = p.policy?.headlessMinRespawnGapMs ?? cfg.policy.headlessMinRespawnGapMs;
+  cfg.policy.headlessMaxWaitMs = p.policy?.headlessMaxWaitMs ?? cfg.policy.headlessMaxWaitMs;
   if (p.policy?.switchModels) {
     cfg.policy.switchModels = p.policy.switchModels.map((s) => s.toLowerCase());
   }

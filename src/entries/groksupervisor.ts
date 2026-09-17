@@ -20,6 +20,8 @@ import { LOOP_DIAGNOSIS, MAX_WRAP_DEPTH, UNMANAGED_ENV, WRAP_DEPTH_ENV, WRAP_RAT
 import { resolveRealGrok } from "../lib/grokbin.ts";
 import { clearGrokPresence, writeGrokPresence } from "../lib/grokpresence.ts";
 import { liveGrokAccountId } from "../lib/groksample.ts";
+import { evaluateAndMaybeSwapGrok } from "../lib/grokdecide.ts";
+import { loadConfig } from "../lib/state.ts";
 import { saveTermios, restoreTermios } from "../lib/tty.ts";
 import { GrokRespawnMarkerSchema } from "../lib/types.ts";
 import { log } from "../lib/log.ts";
@@ -70,6 +72,56 @@ export function shouldManageGrok(input: { argv: string[] }): boolean {
     if (!arg.startsWith("-") && firstPositional === null) firstPositional = arg;
   }
   return firstPositional === null || !NONINTERACTIVE_SUBCMDS.has(firstPositional);
+}
+
+/** grok rejects an empty `-p` prompt ("--single: prompt is empty", verified
+ *  1.0.11 on 2026-09-17), so a headless respawn cannot resume with no text
+ *  the way codex/claude do; this one-word turn is the smallest deviation from
+ *  the owner's empty-resume rule (recorded in docs/auto-swap-long-sessions.md). */
+export const GROK_CONTINUATION_PROMPT = "continue";
+
+/** The respawn form: the ORIGINAL launch shape (flags with their values,
+ *  `-p` kept for a headless run) minus any session selector and minus the
+ *  one-shot positional prompt, plus `--resume <sid>`. Before this the
+ *  supervisor relaunched `["--resume", sid]` alone, which turned a headless
+ *  `-p --output-format …` worker into an interactive TUI on a non-TTY
+ *  (docs/auto-swap-long-sessions.md F7). A null sid falls back to bare
+ *  `--resume` (grok's own picker), as before. */
+export function grokRespawnArgs(input: { argv: string[]; sessionId: string | null }): string[] {
+  const out: string[] = [];
+  const { argv } = input;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === "-r" || a === "--resume") {
+      if (i + 1 < argv.length && !argv[i + 1]!.startsWith("-")) i++;
+      continue;
+    }
+    if (a.startsWith("--resume=")) continue;
+    if (a === "-s" || a === "--session-id") {
+      i++;
+      continue;
+    }
+    if (a === "-c" || a === "--continue" || a === "--fork-session") continue;
+    if (a === "-p" || a === "--single") {
+      out.push(a, GROK_CONTINUATION_PROMPT);
+      i++;
+      continue;
+    }
+    if (VALUE_TAKING_ROOT_FLAGS.has(a)) {
+      out.push(a);
+      if (i + 1 < argv.length) out.push(argv[++i]!);
+      continue;
+    }
+    if (!a.startsWith("-")) continue; // the one-shot prompt is never replayed
+    out.push(a);
+  }
+  out.push("--resume");
+  if (input.sessionId != null) out.push(input.sessionId);
+  return out;
+}
+
+function isHeadlessGrokLaunch(argv: string[]): boolean {
+  return argv.some((a) => a === "-p" || a === "--single");
 }
 
 /** OIDC/SuperGrok session only (issue #1): an ambient API key or external
@@ -161,6 +213,19 @@ export async function runGrokSupervisor(input: { argv: string[] }): Promise<numb
   process.on("SIGINT", () => {});
   process.on("SIGHUP", () => {});
 
+  // Spawn gate for a headless run (docs/auto-swap-long-sessions.md §4.2):
+  // one free credits read, and a swap before anything is running. Never
+  // fatal - a missed read launches on whatever seat is live. TUIs keep the
+  // hook-driven path alone (their first Stop boundary is minutes away).
+  if (isHeadlessGrokLaunch(argv) && loadConfig().policy.headlessManage) {
+    try {
+      const gate = await evaluateAndMaybeSwapGrok({});
+      log("groksupervisor.gate", { supervisorId: supervisorId.slice(0, 8), swapped: gate.swapped, reason: gate.reason });
+    } catch (e) {
+      log("groksupervisor.gate_error", { err: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
   let launchArgs = argv;
   let respawns = 0;
   while (true) {
@@ -234,7 +299,7 @@ export async function runGrokSupervisor(input: { argv: string[] }): Promise<numb
         await countdownWait(payload.account, payload.waitUntil);
       }
       process.stdout.write(`\n\x1b[36m↻ tokenmaxxing: switched grok to ${payload.account} - resuming...\x1b[0m\n`);
-      launchArgs = payload.sessionId ? ["--resume", payload.sessionId] : ["--resume"];
+      launchArgs = grokRespawnArgs({ argv, sessionId: payload.sessionId });
       continue;
     }
     clearGrokPresence({ supervisorId });

@@ -174,6 +174,21 @@ export const ConfigSchema = z
       usagePollTtlMs: z.number().int().positive(),
       /** when every account is depleted, auto-wait for a reset only if it is within this window (ms). */
       maxWaitMs: z.number().int().positive(),
+      /** managed-headless mode (docs/auto-swap-long-sessions.md): `codex exec`,
+       *  `claude -p`, `grok -p` get a spawn gate, an exit-time quota-refusal
+       *  classifier, and a same-session respawn. Off = the pre-1.9 passthrough. */
+      headlessManage: z.boolean(),
+      /** whether the shared claude seat may take a GREEDY (under-bar) swap
+       *  while a managed-headless claude job is running. Off by default: every
+       *  greedy swap costs each live session one cold prompt prefill. Hard-path
+       *  (bar crossed) swaps are never suppressed. */
+      headlessGreedyWithJobs: z.boolean(),
+      /** refusal-driven respawns a single job may take before parking (loop guard). */
+      headlessMaxRespawns: z.number().int().nonnegative(),
+      /** minimum gap between a job's spawns (ms), so a refuse/respawn loop cannot spin. */
+      headlessMinRespawnGapMs: z.number().int().nonnegative(),
+      /** a headless job waits in place for a reset only if it lands within this window (ms); further out it parks with exit 75. */
+      headlessMaxWaitMs: z.number().int().positive(),
     }),
   })
   // Cross-field (review catch, PR #31): effectiveBars subtracts the margin

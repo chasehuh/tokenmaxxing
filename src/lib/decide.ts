@@ -33,6 +33,7 @@ import { chooseAndSwap, performSwap } from "./swap.ts";
 import { currentWins, effectiveBars, hardBars, isExhausted, pickBest, pickEarliestReset, usableAt } from "./picker.ts";
 import { InvalidGrantError } from "./oauth.ts";
 import { familyTokens, gatedFamilies, probeUsage } from "./usage.ts";
+import { livingHeadlessJobs } from "./headless.ts";
 import { log } from "./log.ts";
 import { AccountSchema, ModelUsageStateSchema, UsageStateSchema, type Account, type Config, type ModelUsageState, type UsageState, type UsageWindow } from "./types.ts";
 
@@ -46,6 +47,13 @@ const SwapDecisionSchema = z.object({
   waitUntil: z.number().optional(),
 });
 export type SwapDecision = z.infer<typeof SwapDecisionSchema>;
+
+/** Which actor is asking (docs/auto-swap-long-sessions.md §4.5). `stop` is
+ *  every pre-existing caller (hooks, timer, SDK); `spawn` is a managed-headless
+ *  job's pre-launch gate (greedy allowed: nothing of its own is running yet);
+ *  `refusal` is a job whose seat the server just refused (no cooldown, no
+ *  engagement gate, hard path, never hold or wait on the refused seat). */
+export type ClaudeBoundary = "stop" | "spawn" | "refusal";
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
@@ -188,9 +196,10 @@ export const POST_SWAP_COOLDOWN_MS = 45_000;
  * known-over-limit account, and buys nothing - the normal pick path adopts the
  * recovering account the moment its reset passes.
  */
-export async function evaluateAndMaybeSwap(now = Date.now(), anticipatory = false): Promise<SwapDecision> {
+export async function evaluateAndMaybeSwap(now = Date.now(), anticipatory = false, opts: { boundary?: ClaudeBoundary } = {}): Promise<SwapDecision> {
+  const boundary = opts.boundary ?? "stop";
   const lastSwapAt = loadLastSwapAt();
-  if (lastSwapAt != null && now - lastSwapAt < POST_SWAP_COOLDOWN_MS) {
+  if (boundary !== "refusal" && lastSwapAt != null && now - lastSwapAt < POST_SWAP_COOLDOWN_MS) {
     return depletedReplay(now) ?? { swapped: false, account: null, reason: "post-swap-cooldown" };
   }
 
@@ -203,7 +212,7 @@ export async function evaluateAndMaybeSwap(now = Date.now(), anticipatory = fals
   // NO measurement for the live org (a pre-park just cleared the snapshots),
   // a recorded depleted-wait still replays; a fresh measurement that reads
   // under-threshold never does - measured-healthy must win over a stale wait.
-  if (!isEngaged(usage, mu, activeOrg, cfg, now)) {
+  if (boundary !== "refusal" && !isEngaged(usage, mu, activeOrg, cfg, now)) {
     const measured = usage != null && activeOrg != null && usage.org === activeOrg;
     if (!measured) {
       const replay = depletedReplay(now);
@@ -253,7 +262,7 @@ export async function evaluateAndMaybeSwap(now = Date.now(), anticipatory = fals
       }
     }
 
-    if (!isEngaged(u2, mu2, org2, cfg, now)) {
+    if (boundary !== "refusal" && !isEngaged(u2, mu2, org2, cfg, now)) {
       return depletedReplay(now) ?? { swapped: false, account: null, reason: "raced-already-swapped" };
     }
 
@@ -282,7 +291,15 @@ export async function evaluateAndMaybeSwap(now = Date.now(), anticipatory = fals
     // refresh token on the winner would bounce a healthy session onto a worse
     // account and back. performSwap marks needs-reauth before throwing, so each
     // reload re-ranks without the dead account and the loop must terminate.
-    if (!isOver(u2, mu2, org2, cfg, now)) {
+    if (boundary !== "refusal" && !isOver(u2, mu2, org2, cfg, now)) {
+      // Greedy suppression while managed-headless claude jobs run (owner
+      // decision 2026-09-17, policy.headlessGreedyWithJobs=false): the shared
+      // seat moves every live session, and each move costs every job one cold
+      // prompt prefill. A job's own spawn gate may still converge greedily -
+      // nothing of its own is running yet. Hard-path swaps are unaffected.
+      if (boundary !== "spawn" && !cfg.policy.headlessGreedyWithJobs && livingHeadlessJobs("claude").length > 0) {
+        return { swapped: false, account: null, reason: "greedy-suppressed-headless-jobs" };
+      }
       const ctxAll = { now, thresholds: effectiveBars(cfg), currentAccountUuid: null, switchFamilies };
       while (true) {
         const cur = loadAccounts();
@@ -320,7 +337,9 @@ export async function evaluateAndMaybeSwap(now = Date.now(), anticipatory = fals
     // boundary later by the check timer or the next Stop hook.
     const hardCtx = { now, thresholds: hardBars(cfg), currentAccountUuid: null, switchFamilies };
     const seat = seatOf(loadAccounts());
-    if (seat && !seat.needsReauth && !isExhausted(seat, hardCtx)) {
+    // a refused seat is never held onto: the server's refusal is fresher
+    // than any cached wall reading.
+    if (boundary !== "refusal" && seat && !seat.needsReauth && !isExhausted(seat, hardCtx)) {
       log("decide.last_drop_hold", { account: seat.accountUuid.slice(0, 8) });
       return { swapped: false, account: null, reason: "last-drop-hold" };
     }
@@ -343,7 +362,8 @@ export async function evaluateAndMaybeSwap(now = Date.now(), anticipatory = fals
       const fresh = loadAccounts();
       const current = seatOf(fresh);
       const ctx = { now, thresholds: hardBars(cfg), currentAccountUuid: current?.accountUuid ?? null, switchFamilies };
-      const currentAt = current ? usableAt(current, ctx) : Number.POSITIVE_INFINITY;
+      // (refusal: the current seat is not a wait target off its cached windows)
+      const currentAt = current && boundary !== "refusal" ? usableAt(current, ctx) : Number.POSITIVE_INFINITY;
       const other = pickEarliestReset(fresh.accounts, ctx);
 
       let target: Account | null = null;

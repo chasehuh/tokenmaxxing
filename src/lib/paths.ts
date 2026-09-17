@@ -28,6 +28,11 @@ export const paths = {
   /** the last depleted-wait decision, replayed to sibling hooks (self-expiring). */
   depletedJson: join(TM_HOME, "depleted.json"),
   respawnDir: join(TM_HOME, "respawn"),
+  /** one record per managed-headless job (any backend): {backend, sessionId,
+   *  accountId, state, waitUntil, ...}. Advisory state for `check`'s greedy
+   *  suppression and for wrappers reading a parked job's resume point; the
+   *  codex/grok RUNNING-account guard stays in their presence dirs. */
+  jobsDir: join(TM_HOME, "jobs"),
   binDir: join(TM_HOME, "bin"),
   supervisorLink: join(TM_HOME, "bin", "claude"),
   lockFile: join(TM_HOME, "lock"),

@@ -30,6 +30,11 @@ export const KNOWN_KEYS = [
   "policy.switchModels",
   "policy.usagePollTtlMs",
   "policy.maxWaitMs",
+  "policy.headlessManage",
+  "policy.headlessGreedyWithJobs",
+  "policy.headlessMaxRespawns",
+  "policy.headlessMinRespawnGapMs",
+  "policy.headlessMaxWaitMs",
 ] as const;
 
 const RawFileSchema = z.record(z.string(), z.unknown());

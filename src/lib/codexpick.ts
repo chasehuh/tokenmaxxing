@@ -44,6 +44,25 @@ export function isCodexExhausted(input: { account: CodexAccount; thresholds: Thr
   );
 }
 
+/** When the account is next usable against `thresholds` off its cached
+ *  windows: now if nothing is at/over its bar, else the latest reset among
+ *  its blocked windows (a null reset self-bounds at sampledAt + duration,
+ *  Infinity when unbounded). The headless refusal path waits on the minimum
+ *  of this across the pool (docs/auto-swap-long-sessions.md §4.4). */
+export function codexUsableAt(input: { account: CodexAccount; thresholds: Thresholds; now: number }): number {
+  const { account, thresholds, now } = input;
+  const sampledAt = account.lastUsageAt ?? null;
+  let at = now;
+  for (const window of allWindows(account)) {
+    if (liveUsed({ window, now, sampledAt }) < barFor({ window, thresholds })) continue;
+    const reset =
+      window.resetsAt ??
+      (sampledAt != null && window.windowSeconds != null ? sampledAt + window.windowSeconds * 1000 : Number.POSITIVE_INFINITY);
+    at = Math.max(at, reset);
+  }
+  return at;
+}
+
 /** Forward pace pressure on the weekly aggregate: the burn rate the remaining
  *  weekly quota demands before its reset forfeits it. No sampled weekly window
  *  or no reset anchor ranks last (0): unmeasured must not look urgent. */

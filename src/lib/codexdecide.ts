@@ -14,7 +14,7 @@ import { writeFileAtomic } from "./atomic.ts";
 import { codexPaths } from "./paths.ts";
 import { loadConfig } from "./state.ts";
 import { loadCodexAccounts, loadCodexLastSwapAt, saveCodexAccounts } from "./codexstate.ts";
-import { codexCurrentWins, isCodexEngaged, isCodexExhausted, pickBestCodex } from "./codexpick.ts";
+import { codexCurrentWins, codexUsableAt, isCodexEngaged, isCodexExhausted, pickBestCodex } from "./codexpick.ts";
 import { performCodexSwap } from "./codexswap.ts";
 import { CodexInvalidGrantError, refreshCodexAuth } from "./codexoauth.ts";
 import { fetchCodexUsage } from "./codexusage.ts";
@@ -29,8 +29,23 @@ const CodexSwapDecisionSchema = z.object({
   swapped: z.boolean(),
   account: CodexAccountSchema.nullable(),
   reason: z.string(),
+  /** refusal boundary only: when the soonest pooled seat recovers (epoch ms)
+   *  once nothing is usable now - the headless loop waits or parks on it. */
+  waitUntil: z.number().optional(),
 });
 export type CodexSwapDecision = z.infer<typeof CodexSwapDecisionSchema>;
+
+/** Which actor is asking (docs/auto-swap-long-sessions.md §4.5):
+ *  - stop: a supervised TUI's Stop hook (the original path; default)
+ *  - spawn: a managed-headless job about to launch - nothing of its own is
+ *    running yet, so a codex swap here is free (no restart)
+ *  - timer: `tokenmaxxing check` - refreshes the snapshot, but never moves a
+ *    seat something is running on (a running codex cannot adopt; the
+ *    reconcile only covers TUIs, headless jobs follow at their next refusal)
+ *  - refusal: the server just refused the live seat for THIS job - no
+ *    cooldown, no engagement gate, no greedy margin: hard path, and when no
+ *    seat is usable now, report the soonest recovery instead of staying put */
+export type CodexBoundary = "stop" | "spawn" | "timer" | "refusal";
 
 const POST_SWAP_COOLDOWN_MS = 45_000;
 
@@ -145,6 +160,9 @@ function reconcileNonLiveSiblings(input: {
     // (`codex resume <sid>`), and makes the whole pool follow the seat.
     // Unpooled seats stay untouched: not ours to move.
     if (!seated) continue;
+    // a managed-headless job has no Stop boundary to promote a signal at; it
+    // rides its account to the refusal and resumes onto the live seat itself.
+    if (presence.headless) continue;
     const markerPath = join(codexPaths.reconcileDir, presence.supervisorId);
     if (existsSync(markerPath)) continue;
     mkdirSync(codexPaths.reconcileDir, { recursive: true });
@@ -164,8 +182,9 @@ function postSwapResweep(input: { liveAccountId: string; bars: { session: number
   }
 }
 
-export async function evaluateAndMaybeSwapCodex(input: { now?: number }): Promise<CodexSwapDecision> {
+export async function evaluateAndMaybeSwapCodex(input: { now?: number; boundary?: CodexBoundary }): Promise<CodexSwapDecision> {
   const now = input.now ?? Date.now();
+  const boundary = input.boundary ?? "stop";
   const cfg = loadConfig();
   const bars = effectiveBars(cfg);
 
@@ -192,17 +211,30 @@ export async function evaluateAndMaybeSwapCodex(input: { now?: number }): Promis
     // revalidates the destination's usability at consumption time.
     reconcileNonLiveSiblings({ index, liveAccountId: activeId, bars, now });
 
+    // A refusal outranks the cooldown: the server just proved the seat walled,
+    // and a job dying 10s after a sibling's swap must still be re-evaluated
+    // (its seat may be the one that just got departed - see seat-moved in the
+    // headless adapter - or the fresh seat itself may be walled).
     const lastSwapAt = loadCodexLastSwapAt();
-    if (lastSwapAt != null && now - lastSwapAt < POST_SWAP_COOLDOWN_MS) {
+    if (boundary !== "refusal" && lastSwapAt != null && now - lastSwapAt < POST_SWAP_COOLDOWN_MS) {
       return { swapped: false, account: null, reason: "post-swap-cooldown" };
     }
 
     // Freshness: re-sample the live credential once its owner's cached
-    // snapshot ages past the poll TTL (there is no push feed in between).
+    // snapshot ages past the poll TTL (there is no push feed in between). A
+    // refusal always re-samples (the cache is proven stale), but a failed
+    // sample must not block the swap away from a refused seat.
     const activeEntry = index.accounts.find((account) => account.accountId === activeId);
-    const stale = activeEntry?.lastUsageAt == null || now - activeEntry.lastUsageAt > cfg.policy.usagePollTtlMs;
+    const stale = boundary === "refusal" || activeEntry?.lastUsageAt == null || now - activeEntry.lastUsageAt > cfg.policy.usagePollTtlMs;
     if (stale) {
-      const sampledId = await sampleLiveOntoOwner({ now });
+      let sampledId: string | null = null;
+      try {
+        sampledId = await sampleLiveOntoOwner({ now });
+      } catch (e) {
+        if (boundary !== "refusal") throw e;
+        log("codexdecide.refusal_sample_miss", { err: e instanceof Error ? e.message : String(e) });
+        sampledId = activeId;
+      }
       if (sampledId == null) {
         return { swapped: false, account: null, reason: "live-credential-not-in-pool" };
       }
@@ -212,10 +244,17 @@ export async function evaluateAndMaybeSwapCodex(input: { now?: number }): Promis
     const active = index.accounts.find((account) => account.accountId === activeId) ?? null;
     if (!active) return { swapped: false, account: null, reason: "no-active-account" };
 
+    // The timer only refreshes: a seat with a session (TUI or headless job)
+    // on it is never moved by an actor that cannot restart the session.
+    if (boundary === "timer" && presentCodexAccountIds().has(activeId)) {
+      return { swapped: false, account: null, reason: "seat-in-use" };
+    }
+
     // A dead live grant always engages: the seat is unusable regardless of
     // cached usage, and codexCurrentWins/pickBestCodex already exclude
     // needs-reauth accounts, so both branches route onto a healthy target.
     const engaged =
+      boundary === "refusal" ||
       active.needsReauth === true ||
       isCodexEngaged({ account: active, floor: cfg.policy.greedySessionFloor, now }) ||
       isCodexExhausted({ account: active, thresholds: bars, now });
@@ -225,8 +264,9 @@ export async function evaluateAndMaybeSwapCodex(input: { now?: number }): Promis
     // that beats the seat by the respawn-cost margin, never onto one RUNNING
     // in another session (presence files); re-rank after a dead grant
     // (performCodexSwap persists needs-reauth before throwing, so the loop
-    // terminates).
-    if (!isCodexExhausted({ account: active, thresholds: bars, now })) {
+    // terminates). A refusal never takes this path: the seat is walled
+    // whatever the (possibly missed) sample says.
+    if (boundary !== "refusal" && !isCodexExhausted({ account: active, thresholds: bars, now })) {
       while (true) {
         const current = loadCodexAccounts();
         const candidates = targetableCodexAccounts({ accounts: current.accounts, activeAccountId: activeId });
@@ -274,7 +314,18 @@ export async function evaluateAndMaybeSwapCodex(input: { now?: number }): Promis
         (account) => !tried.has(account.accountId),
       );
       const best = pickBestCodex({ accounts: candidates, thresholds: bars, now, currentAccountId: activeId });
-      if (!best) return { swapped: false, account: null, reason: "all-depleted" };
+      if (!best) {
+        if (boundary !== "refusal") return { swapped: false, account: null, reason: "all-depleted" };
+        // the refused seat itself is never waited on off its cached windows
+        // (the refusal is fresher than any snapshot); every other pooled,
+        // reauth-free account competes on its own recovery time.
+        const soonest = Math.min(
+          ...current.accounts
+            .filter((account) => account.accountId !== activeId && account.needsReauth !== true)
+            .map((account) => codexUsableAt({ account, thresholds: bars, now })),
+        );
+        return { swapped: false, account: null, reason: "all-depleted", ...(Number.isFinite(soonest) ? { waitUntil: soonest } : {}) };
+      }
       tried.add(best.accountId);
       try {
         await performCodexSwap({ target: best });

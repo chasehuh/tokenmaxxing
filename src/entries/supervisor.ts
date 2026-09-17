@@ -17,6 +17,10 @@ import { saveTermios, restoreTermios } from "../lib/tty.ts";
 import { loadSessionFlags, pruneStaleSessions, saveSessionFlags } from "../lib/sessions.ts";
 import { RespawnMarkerSchema } from "../lib/types.ts";
 import { log } from "../lib/log.ts";
+import { loadConfig } from "../lib/state.ts";
+import { readOAuthAccount } from "../lib/claudejson.ts";
+import { evaluateAndMaybeSwap } from "../lib/decide.ts";
+import { HEADLESS_JOB_ID_ENV, claudeTranscriptRefusal, resolveClaudeSessionId, runHeadlessJob, type HeadlessAdapter } from "../lib/headless.ts";
 
 const NONINTERACTIVE_SUBCMDS = new Set([
   "mcp", "config", "doctor", "update", "install", "migrate-installer",
@@ -52,6 +56,10 @@ const isUuid = (s: string) => z.uuid().safeParse(s).success;
 
 const AnalysisSchema = z.object({
   manage: z.boolean(),
+  /** a managed-headless `-p` run (docs/auto-swap-long-sessions.md §4.1):
+   *  print mode with a session to resume - never help/version, subcommands,
+   *  picker/fork resumes, or a malformed session id. */
+  headless: z.boolean(),
   sessionId: z.string().nullable(),
   resumeId: z.string().nullable(),
   continueLatest: z.boolean(),
@@ -63,6 +71,7 @@ export function analyzeArgs(argv: string[]): Analysis {
   let resumeId: string | null = null;
   let continueLatest = false;
   let printMode = false;
+  let helpOrVersion = false;
   let invalidSessionArg = false;
   let pickerResume = false;
   let forkSession = false;
@@ -71,7 +80,7 @@ export function analyzeArgs(argv: string[]): Analysis {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "-p" || a === "--print") printMode = true;
-    else if (a === "--version" || a === "-v" || a === "--help" || a === "-h") printMode = true;
+    else if (a === "--version" || a === "-v" || a === "--help" || a === "-h") helpOrVersion = true;
     else if (a === "--session-id") {
       // A non-UUID here must never become supervisor state: the sid names the
       // respawn-marker and session-flag paths (an unvalidated value could
@@ -128,8 +137,10 @@ export function analyzeArgs(argv: string[]): Analysis {
   // picker-mode resume (closing-review catch: managing it paired the marker
   // to the stale pre-fork sid, and a respawn would fork yet another session).
   const forkResume = forkSession && (resumeId !== null || continueLatest);
-  const manage = !printMode && !isSubcmd && !invalidSessionArg && !pickerResume && !forkResume && !process.env.TOKENMAXXING_PROBE;
-  return { manage, sessionId, resumeId, continueLatest };
+  const eligible = !isSubcmd && !invalidSessionArg && !pickerResume && !forkResume && !process.env.TOKENMAXXING_PROBE;
+  const manage = !printMode && !helpOrVersion && eligible;
+  const headless = printMode && !helpOrVersion && eligible;
+  return { manage, headless, sessionId, resumeId, continueLatest };
 }
 
 /** Remove session-selecting flags so we can inject our own on respawn. Managed
@@ -273,6 +284,16 @@ export async function runSupervisor(argv: string[]): Promise<number> {
   const info = analyzeArgs(argv);
   const childEnv = { ...process.env, [WRAP_DEPTH_ENV]: String(depth + 1) };
 
+  // Managed-headless `-p` (docs/auto-swap-long-sessions.md): swaps still
+  // land through the hooks/timer and adopt in place as before; this adds the
+  // spawn gate, the exit-time refusal classifier, and `-p "" --resume <sid>`.
+  if (info.headless && !process.env[UNMANAGED_ENV]) {
+    const cfg = loadConfig();
+    if (cfg.policy.headlessManage) {
+      return runHeadlessJob({ adapter: claudeHeadlessAdapter({ real, childEnv, info, argv, cwd: process.cwd() }), argv, cfg, cwd: process.cwd() });
+    }
+  }
+
   // Pass-through: no session management, no respawn - exact stock behavior.
   // The unmanaged-zone sentinel (pooledSpawnEnv) forces it regardless of argv:
   // everything below an SDK-driven session runs the real claude unsupervised,
@@ -394,4 +415,65 @@ export async function runSupervisor(argv: string[]): Promise<number> {
     log("supervisor.exit", { sid, respawns, code: child.exitCode, signal: child.signalCode });
     return child.exitCode ?? (child.signalCode ? 1 : 0);
   }
+}
+
+/** The managed-headless adapter for `claude -p` (docs/auto-swap-long-sessions.md
+ *  §4). Claude hot-adopts swaps, so the gate and the refusal path only move
+ *  the shared seat; the respawn is `-p "" --resume <sid>` with the persisted
+ *  flags (owner decision 2026-09-17: an EMPTY prompt, no injected text). The
+ *  live seat identity is the org (quota is metered per organizationUuid). */
+function claudeHeadlessAdapter(input: { real: string; childEnv: Record<string, string | undefined>; info: Analysis; argv: string[]; cwd: string }): HeadlessAdapter {
+  const { real, childEnv, info, argv, cwd } = input;
+  // a fresh `-p` gets a pinned id so the respawn can name it; `-c` and
+  // `--resume <uuid>` keep claude's own choice (learned from argv or the
+  // transcript side channel).
+  let pinned: string | null = info.sessionId ?? info.resumeId ?? null;
+  const injectSessionId = pinned == null && !info.continueLatest;
+  if (injectSessionId) pinned = crypto.randomUUID();
+  const persistable = stripPositionals(stripSessionFlags(argv));
+  const liveOrg = () => readOAuthAccount()?.organizationUuid ?? null;
+  return {
+    backend: "claude",
+    liveAccountId: liveOrg,
+    spawnGate: async () => {
+      const d = await evaluateAndMaybeSwap(Date.now(), false, { boundary: "spawn" });
+      return { swapped: d.swapped, reason: d.reason };
+    },
+    spawn: async ({ args, jobId }) => {
+      const first = args === argv && injectSessionId && pinned != null ? [...args, "--session-id", pinned] : args;
+      if (pinned != null) saveSessionFlags(pinned, persistable, cwd);
+      // NOT TOKENMAXXING_SUPERVISED: the Stop hook's depleted pre-park writes a
+      // respawn marker only for a supervisor that watches one; this loop
+      // pauses on its own refusal path instead. UNMANAGED for the subtree, so
+      // a nested `claude -p` inside the job is a plain child.
+      const child = Bun.spawn([real, ...first], {
+        stdin: "inherit",
+        stdout: "inherit",
+        stderr: "inherit",
+        env: { ...childEnv, [UNMANAGED_ENV]: "1", [HEADLESS_JOB_ID_ENV]: jobId },
+      });
+      return { child, accountId: liveOrg() };
+    },
+    afterExit: () => {},
+    knownSessionId: () => pinned,
+    resolveSessionId: ({ spawnedAt, now }) => {
+      if (pinned != null) return { kind: "id", id: pinned };
+      return resolveClaudeSessionId({ cwd, since: spawnedAt, now });
+    },
+    refusalEvidence: ({ sessionId, spawnedAt }) => (sessionId != null ? claudeTranscriptRefusal({ sessionId, cwd, since: spawnedAt }) : null),
+    refusalDecision: async ({ refusedAccountId }) => {
+      const live = liveOrg();
+      if (live != null && refusedAccountId != null && live !== refusedAccountId) {
+        // the seat already moved (a sibling's hook or the timer): resume on it
+        return { swapped: false, account: null, waitUntil: null, reason: "seat-moved" };
+      }
+      const d = await evaluateAndMaybeSwap(Date.now(), false, { boundary: "refusal" });
+      return { swapped: d.swapped, account: d.account?.label ?? null, waitUntil: d.waitUntil ?? null, reason: d.reason };
+    },
+    resumeArgs: ({ sessionId }) => {
+      pinned = sessionId;
+      saveSessionFlags(sessionId, persistable, cwd);
+      return [...persistable, "--resume", sessionId, ""];
+    },
+  };
 }
